@@ -1,6 +1,18 @@
+
 from __future__ import annotations
 import struct, hmac, hashlib
 from typing import Optional
+
+# Optional libsodium (PyNaCl) acceleration
+try:
+    from nacl.bindings import (
+        crypto_stream_chacha20_ietf_xor_ic,
+        crypto_stream_chacha20_ietf_NONCEBYTES as SODIUM_NONCEBYTES,
+        crypto_stream_chacha20_ietf_KEYBYTES as SODIUM_KEYBYTES,
+    )
+    _HAS_SODIUM = True
+except Exception:
+    _HAS_SODIUM = False
 
 def _rotl32(x, n): return ((x << n) & 0xffffffff) | (x >> (32 - n))
 
@@ -42,12 +54,10 @@ def _hkdf_mix(key: bytes, data: bytes, out_len: int) -> bytes:
         out += t; counter += 1
     return out[:out_len]
 
-class ChaCha20DRBG:
+class _PureChaCha20DRBG:
     """
-    DRBG minimal:
-      - Estado: key(32), nonce(12), counter(64)
-      - generate(n): keystream ChaCha20
-      - reseed(entropy): mezcla con HKDF y rekey
+    Versión pura en Python (fallback). Mantiene compat API.
+    Estado: key(32), nonce(12), counter(64)
     """
     def __init__(self, seed: bytes):
         if len(seed) < 32:
@@ -55,21 +65,73 @@ class ChaCha20DRBG:
         material = _hkdf_mix(b"\x00"*32, seed, 44)  # 32+12
         self.key   = material[:32]
         self.nonce = material[32:44]
-        self.counter = 0
+        self.counter = 0  # 64-bit block counter
 
     def generate(self, n: int) -> bytes:
         out = bytearray()
-        while len(out) < n:
-            block = _chacha20_block(self.key, self.counter, self.nonce)
+        # batch por bloques de 64 bytes
+        blocks = (n + 63) // 64
+        for _ in range(blocks):
+            out.extend(_chacha20_block(self.key, self.counter, self.nonce))
             self.counter = (self.counter + 1) & ((1<<64)-1)
-            out.extend(block)
         return bytes(out[:n])
 
     def reseed(self, entropy: bytes):
-        # rekey + new nonce, counter reset
         if not entropy:
             return
         material = _hkdf_mix(self.key, entropy + struct.pack("<Q", self.counter), 44)
         self.key   = material[:32]
         self.nonce = material[32:44]
         self.counter = 0
+
+class _SodiumChaCha20DRBG:
+    """
+    Implementación acelerada con libsodium (PyNaCl).
+    Usa chacha20-ietf (nonce 12, counter 32/64-bit ic).
+    """
+    def __init__(self, seed: bytes):
+        if len(seed) < 32:
+            raise ValueError("seed must be >= 32 bytes")
+        material = _hkdf_mix(b"\x00"*32, seed, 44)  # 32+12
+        self.key   = material[:32]
+        self.nonce = material[32:44]
+        self.counter = 0  # ic: bloque inicial (en bloques de 64 bytes)
+
+    def generate(self, n: int) -> bytes:
+        out = bytearray()
+        remaining = n
+        # chunks grandes para minimizar overhead (256 KiB)
+        CHUNK = 1024 * 1024
+        while remaining > 0:
+            take = CHUNK if remaining > CHUNK else remaining
+            zeros = b"\x00" * take
+            ct = crypto_stream_chacha20_ietf_xor_ic(zeros, self.nonce, self.counter, self.key)
+            out.extend(ct)
+            # avanzar contador en bloques de 64 bytes
+            self.counter += (take + 63) // 64
+            remaining -= take
+        return bytes(out[:n])
+
+    def reseed(self, entropy: bytes):
+        if not entropy:
+            return
+        material = _hkdf_mix(self.key, entropy + struct.pack("<Q", self.counter), 44)
+        self.key   = material[:32]
+        self.nonce = material[32:44]
+        self.counter = 0
+
+class ChaCha20DRBG:
+    """
+    DRBG minimal con backend auto-seleccionado:
+      - Si hay libsodium → _SodiumChaCha20DRBG (rápido)
+      - Si no → _PureChaCha20DRBG (fallback)
+    API: generate(n) -> bytes, reseed(entropy)
+    """
+    def __init__(self, seed: bytes):
+        self._impl = _SodiumChaCha20DRBG(seed) if _HAS_SODIUM else _PureChaCha20DRBG(seed)
+
+    def generate(self, n: int) -> bytes:
+        return self._impl.generate(n)
+
+    def reseed(self, entropy: bytes):
+        self._impl.reseed(entropy)

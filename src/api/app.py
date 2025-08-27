@@ -2,25 +2,43 @@
 from __future__ import annotations
 import os, asyncio, struct
 from fastapi import FastAPI, Request, Response, Header, Query
+from fastapi.responses import StreamingResponse
+from starlette.middleware import Middleware
 
 from trng.queue import TrngQueue
 from trng.config import GenConfig
 from trng.sources import FileVideoSource, CameraVideoSource
 from trng.generator import TRNGGenerator
 from trng.alea import AleaMaris
+from starlette.middleware.cors import CORSMiddleware
 
-app = FastAPI(title="AleaMaris TRNG API (RAW + ChaCha20-DRBG)")
 
-RAW_CAP               = int(os.environ.get("ALEAMARIS_RAW_CAP", "1000000"))
+middleware = [
+    Middleware(
+        CORSMiddleware,
+        allow_origins=[
+            "*"
+        ],
+        allow_origin_regex=r".*",   # acepta lo que no esté listado (evita sustos)
+        allow_credentials=False,    # si lo pones True, no puedes usar '*'
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["X-Count", "X-Available-After"],
+    )
+]
+
+app = FastAPI(title="AleaMaris TRNG API", middleware=middleware)
+
+RAW_CAP               = int(os.environ.get("ALEAMARIS_RAW_CAP", "100000000"))
 BOOT_BYTES            = int(os.environ.get("ALEAMARIS_BOOT_BYTES", "65536"))
 ALLOW_URANDOM_BOOT    = os.environ.get("ALEAMARIS_ALLOW_URANDOM", "0").lower() in ("1","true","yes")
-VIDEO_PATH            = os.environ.get("ALEAMARIS_VIDEO", "")
+VIDEO_PATH            = os.environ.get("ALEAMARIS_VIDEO", "sample2.mp4")
 CAM_INDEX             = int(os.environ.get("ALEAMARIS_CAM", "0"))
-FILL_LOW_WM           = int(os.environ.get("ALEAMARIS_RAW_LOW_WM",  "65536"))     # low watermark
-FILL_HIGH_WM          = int(os.environ.get("ALEAMARIS_RAW_HIGH_WM", "262144"))    # high watermark
+FILL_LOW_WM           = int(os.environ.get("ALEAMARIS_RAW_LOW_WM",  "10000"))     # low watermark
+FILL_HIGH_WM          = int(os.environ.get("ALEAMARIS_RAW_HIGH_WM", "900000"))    # high watermark
 FILL_INTERVAL_MS      = int(os.environ.get("ALEAMARIS_FILL_INTERVAL_MS", "200"))  # cada 200ms check
-FILL_CHUNK_BYTES      = int(os.environ.get("ALEAMARIS_FILL_CHUNK", "32768"))      # tamaño de aportes
-RESEED_PERIOD_SEC     = int(os.environ.get("ALEAMARIS_RESEED_PERIOD", "10"))      # reseed cada 10s
+FILL_CHUNK_BYTES      = int(os.environ.get("ALEAMARIS_FILL_CHUNK", "65536"))      # tamaño de aportes
+RESEED_PERIOD_SEC     = int(os.environ.get("ALEAMARIS_RESEED_PERIOD", "60"))      # reseed cada minuto
 RESEED_BYTES          = int(os.environ.get("ALEAMARIS_RESEED_BYTES", "64"))       # bytes por reseed
 API_KEY               = os.environ.get("ALEAMARIS_API_KEY")                       # opcional
 
@@ -33,6 +51,7 @@ q = TrngQueue(cap_bytes=RAW_CAP)
 def _try_bytes_from_video_or_cam(n: int) -> bytes:
     """Intenta sacar n bytes desde VIDEO y/o CAM. Rebobina si es fichero."""
     if VIDEO_PATH:
+        print("video dump started")
         try:
             src = FileVideoSource(VIDEO_PATH)
             gen = TRNGGenerator(src, GEN_CFG)
@@ -92,9 +111,11 @@ async def _filler_loop():
                 if not chunk and ALLOW_URANDOM_BOOT:
                     chunk = os.urandom(need_total)
                 if chunk:
+                    print(f"filler: Offered {len(chunk)} to queue")
                     q.offer(chunk)
-        except Exception:
+        except Exception as e:
             # No tiramos la app por fallos de cámara/vídeo; reintentamos en la próxima vuelta
+            print(f"filler: failed with exception {e}")
             pass
         await asyncio.sleep(FILL_INTERVAL_MS / 1000.0)
 
@@ -111,9 +132,12 @@ async def _reseed_loop():
 
 @app.on_event("startup")
 async def _startup():
+    print("startup called")
+
     # 1) Boot: intentar poblar la RAW con BOOT_BYTES
     boot = _try_bytes_from_video_or_cam(BOOT_BYTES)
     if not boot and ALLOW_URANDOM_BOOT:
+        print("boot falling back to urandom")
         boot = os.urandom(BOOT_BYTES)
     if not boot:
         # requisito: “si no hay vídeo/cam y no se permite urandom → PETA”
@@ -167,21 +191,23 @@ def rng_bytes(count: int = Query(default=256, ge=1, le=1_048_576),
                     headers={"X-Count": str(len(data))})
 
 @app.get("/rng/ints")
-def rng_ints(mini: int = Query(default=0),
-             maxi: int = Query(default=36),
+def rng_ints(min: int = Query(default=0),
+             max: int = Query(default=36),
              count: int = Query(default=10, ge=1, le=100_000),
              reseed: bool = Query(default=True),
              fmt: str = Query(default="json")):
-    if mini > maxi:
+    if min > max:
         return Response(status_code=400, content=b'{"error":"min>max"}', media_type="application/json")
     if reseed:
         _reseed_from_queue()
-    vals = [_rng.randint(mini, maxi) for _ in range(count)]
+    print(min)
+    print(max)
+    vals = [_rng.randint(min, max) for _ in range(count)]
     if fmt == "bin":
         payload = b"".join(struct.pack("<I", v) for v in vals)
         return Response(content=payload, media_type="application/octet-stream",
                         headers={"X-Count": str(len(vals))})
-    return {"count": len(vals), "min": mini, "max": maxi, "values": vals}
+    return {"count": len(vals), "min": min, "max": max, "values": vals}
 
 @app.post("/rng/reseed")
 async def rng_reseed(request: Request):
@@ -190,6 +216,61 @@ async def rng_reseed(request: Request):
         return {"received": 0, "status": "no-op"}
     _rng.reseed(data)
     return {"received": len(data), "status": "ok"}
+
+
+
+def _u32bin_stream(count: int, endian="le", batch=100_000):
+    remaining = count
+    while remaining > 0:
+        take = min(batch, remaining)
+        raw = _rng.random_bytes(take * 4)
+        if endian == "be":
+            # emitir tal cual
+            yield raw
+        else:
+            # swap a little endian
+            mv = memoryview(raw)
+            out = bytearray(len(raw))
+            out[0::4] = mv[3::4]
+            out[1::4] = mv[2::4]
+            out[2::4] = mv[1::4]
+            out[3::4] = mv[0::4]
+            yield bytes(out)
+        remaining -= take
+
+@app.get("/rng/u32.bin")
+def rng_u32_bin(count: int = Query(100_000, ge=1, le=25_000_000),
+                endian: str = Query("le", pattern="^(le|be)$"),
+                reseed: bool = Query(default=True)):
+    if reseed:
+        _reseed_from_queue()
+    return StreamingResponse(
+        _u32bin_stream(count, endian=endian),
+        media_type="application/octet-stream",
+        headers={"X-Count": str(count)}
+    )
+
+def _u32jsonl_stream(count: int, batch=100_000):
+    import struct
+    remaining = count
+    while remaining > 0:
+        take = min(batch, remaining)
+        raw = _rng.random_bytes(take * 4)
+        ints = struct.unpack(">" + "I"*take, raw)
+        yield ("\n".join(str(x) for x in ints) + "\n").encode()
+        remaining -= take
+
+@app.get("/rng/u32.jsonl")
+def rng_u32_jsonl(count: int = Query(100_000, ge=1, le=2_000_000),
+                  reseed: bool = Query(default=True)):
+    if reseed:
+        _reseed_from_queue()
+    return StreamingResponse(
+        _u32jsonl_stream(count),
+        media_type="application/x-ndjson",
+        headers={"X-Count": str(count)}
+    )
+
 
 @app.get("/rng/stats")
 def rng_stats():
