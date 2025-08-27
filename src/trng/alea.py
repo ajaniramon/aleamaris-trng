@@ -53,7 +53,6 @@ class AleaMaris:
         return bytes(out)
 
     def rand_u32(self) -> int:
-        # Evita 100k llamadas al DRBG: tira del buffer
         b = self.random_bytes(4)
         return struct.unpack(">I", b)[0]
 

@@ -21,21 +21,20 @@
 - SHA-256 conditioning
 - CLI generator (`bin/trng_cli.py`)
 - Debug mode (PNG/BIN/JSON dumps of first frames)
-- API server (FastAPI) with `/trng/bytes` and `/trng/health`
-
-### 🔧 In Progress
-- Casino-ready RNG methods (`randrange`, `randint`, `uniform01`)
+- API server (FastAPI)
+- Casino-ready RNG methods
 - Bias-free rejection sampling for fair dice/roulette
-- Multi-source entropy (video + audio + sensors)
 - Advanced extractors (SHAKE256 / BLAKE3)
 - Premium DRBG engines (ChaCha20-DRBG, HMAC-DRBG) with reseed
+
+### 🔧 In Progress
+- Multi-source entropy (video + audio + sensors)
 - Fortuna-style multipools for forward secrecy
 - Emulator integration (WRAM mailbox for BGB/Emulicious)
 - Game Boy hardware demo (ESP32 + Link Port)
 - Observability: entropy metrics, Prometheus/Grafana integration
 - Health tests (NIST SP 800-90B RCT/APT online)
 - Transparency logging of reseed events
-
 ---
 
 ## 🧩 Project Structure
