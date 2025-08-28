@@ -1,0 +1,8 @@
+# AleaMaris TRNG — Web UI (static)
+FROM nginx:1.27-alpine
+
+# Copiar web
+COPY src/web /usr/share/nginx/html
+COPY docker/web/nginx.conf /etc/nginx/conf.d/default.conf
+
+EXPOSE 80
