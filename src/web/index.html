@@ -8,38 +8,48 @@
   <script src="https://cdn.tailwindcss.com"></script>
   
   <style>
-    .card{ background:rgba(255,255,255,.85); -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px); border-radius:1rem; box-shadow:0 10px 20px rgba(2,6,23,.06), 0 2px 6px rgba(2,6,23,.08); padding:1rem; }
-    .btn{ border-radius:.75rem; padding:.5rem 1rem; font-weight:600; box-shadow:0 1px 2px rgba(0,0,0,.06); transition:transform .05s ease, background-color .15s ease, box-shadow .15s ease; display:inline-flex; align-items:center; gap:.5rem; }
+    /* Cards en modo oscuro (vidrio oscuro) */
+    .card{ background:rgba(2,6,23,.72); -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px); border-radius:1rem; box-shadow:0 10px 20px rgba(0,0,0,.35), 0 2px 6px rgba(0,0,0,.25); padding:1rem; border:1px solid rgba(148,163,184,.15); color:#e5e7eb; }
+    .btn{ border-radius:.75rem; padding:.5rem 1rem; font-weight:600; box-shadow:0 1px 2px rgba(0,0,0,.25); transition:transform .05s ease, background-color .15s ease, box-shadow .15s ease; display:inline-flex; align-items:center; gap:.5rem; }
     .btn:active{ transform:translateY(1px); box-shadow:0 0 0 rgba(0,0,0,0); }
-    .btn-primary{ background:#2563eb; color:#fff; }
-    .btn-primary:hover{ background:#1d4ed8; }
-    .btn-ghost{ background:#e2e8f0; color:#0f172a; }
-    .btn-ghost:hover{ background:#cbd5e1; }
+  .btn-primary{ background:#1e293b; color:#e5e7eb; border:1px solid #475569; }
+  .btn-primary:hover{ background:#334155; }
+    .btn-ghost{ background:#334155; color:#e5e7eb; }
+    .btn-ghost:hover{ background:#475569; }
     .pill{ font-size:.75rem; padding:.125rem .5rem; border-radius:9999px; font-weight:600; }
     .grid-2{ display:grid; grid-template-columns: 1fr 1fr; gap:1rem; }
     .mono{ font-family: ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; }
     .spark { height: 40px; width: 100%; }
-    /* Inputs visibly styled */
+    /* Inputs modo oscuro */
     input[type="text"], input[type="number"], input[type="file"], select, textarea {
-      border:1px solid #cbd5e1; border-radius:.75rem; padding:.5rem .75rem; background:#fff; color:#0f172a;
+      border:1px solid #334155; border-radius:.75rem; padding:.5rem .75rem; background:#0b1220; color:#cbd5e1; caret-color:#93c5fd;
     }
+    textarea{ line-height:1.35; letter-spacing:.2px; }
+    input::placeholder, textarea::placeholder{ color:#7c8aa0; }
     input:focus, select:focus, textarea:focus {
-      outline:2px solid #93c5fd; outline-offset:2px; border-color:#93c5fd;
+      outline:2px solid #38bdf8; outline-offset:2px; border-color:#38bdf8;
     }
-    /* Utility tweaks */
-    .mt-1{ margin-top:.25rem; }
-    .mt-2{ margin-top:.5rem; }
-    .mb-3{ margin-bottom:.75rem; }
+    /* Ajuste de textos secundarios dentro de cards */
+    .card .text-slate-600{ color:#cbd5e1 !important; }
+    /* Pre/code bloques oscuros */
+    .card pre{ background:#0b1220 !important; color:#e2e8f0 !important; border:1px solid #334155; }
+    /* Animated background canvas */
+    #bgCanvas{ position:fixed; inset:0; width:100vw; height:100vh; z-index:0; pointer-events:none; opacity:.6; filter:none; }
+    header, main { position: relative; z-index: 1; }
+  /* Inputs específicos: API Base URL y API Key (estilo uniforme) */
+  #apiBase, #apiKey{ background:#0b1220; color:#e5e7eb; border-color:#475569; font-family: ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; }
+  #apiBase::placeholder, #apiKey::placeholder{ color:#7c8aa0; }
   </style>
 
 </head>
-<body class="bg-gradient-to-br from-sky-50 to-indigo-100 min-h-screen text-slate-800">
-  <header class="max-w-6xl mx-auto px-4 pt-6 pb-2">
+<body class="bg-gradient-to-br from-slate-950 via-indigo-950 to-slate-900 min-h-screen text-slate-100">
+  <canvas id="bgCanvas"></canvas>
+  <header class="max-w-6xl mx-auto px-4 pt-6 pb-2 text-slate-100">
     <div class="flex items-center gap-4">
       <img src="aleamaris_logo.png" alt="AleaMaris" class="w-14 h-14 rounded-xl shadow">
       <div>
         <h1 class="text-2xl font-extrabold">AleaMaris Console</h1>
-        <p class="text-sm text-slate-600">True Randomness from the Sea — RAW & ChaCha20-DRBG control panel</p>
+  <p class="text-sm text-slate-300">True Randomness from the Sea — RAW & ChaCha20-DRBG control panel</p>
       </div>
     </div>
   </header>
@@ -54,9 +64,14 @@
           <input id="apiBase" class="w-full mt-1 rounded-xl border-slate-300" placeholder="http://localhost:8080" />
           <p class="text-xs text-slate-500 mt-1">Deja vacío para usar el mismo host (mismo origen).</p>
         </div>
+        <div class="w-64">
+          <label class="block text-sm font-medium">API Key (opcional)</label>
+          <input id="apiKey" class="w-full mt-1 rounded-xl border-slate-300" placeholder="X-API-Key" />
+          <p class="text-xs text-slate-500 mt-1">Usada para /trng/ingest y /rng/reseed.</p>
+        </div>
         <button id="saveBase" class="btn btn-ghost">Save</button>
-        <button id="ping" class="btn btn-primary">Ping /rng/stats</button>
-        <span id="statusDot" class="pill bg-slate-200">idle</span>
+  <button id="ping" class="btn btn-primary">Ping /rng/stats</button>
+  <span id="statusDot" class="pill bg-slate-700 text-slate-200">idle</span>
       </div>
     </section>
 
@@ -119,6 +134,7 @@
             <button id="btnRawDownload" class="btn btn-primary">Download</button>
           </div>
           <textarea id="rawHex" rows="5" class="w-full mono rounded-xl border-slate-300" placeholder="hex preview…"></textarea>
+          <div class="text-xs text-slate-600">Time: <span id="rawTime">—</span> ms · Size: <span id="rawSize">—</span></div>
         </div>
         <div class="space-y-3">
           <label class="block text-sm font-medium">Ingest RAW (append to queue)</label>
@@ -129,58 +145,75 @@
       </div>
     </section>
 
-    <!-- DRBG controls -->
+    <!-- DRBG bytes -->
     <section class="card">
-      <h2 class="font-bold text-lg mb-3">DRBG (ChaCha20)</h2>
-<div class="mb-3 text-sm text-slate-600">Fast binary endpoints available: <code>/rng/u32.bin</code> (uint32 stream) and <code>/rng/bytes</code>.</div>
-      <div class="grid-2">
-        <div class="space-y-3">
-          <div class="flex gap-2 items-end">
-            <div class="grow">
-              <label class="block text-sm font-medium">Bytes</label>
-              <input id="rngCount" type="number" value="1024" min="1" max="1048576" class="w-full mt-1 rounded-xl border-slate-300">
-            </div>
-            <label class="text-sm flex items-center gap-2">
-              <input id="rngReseed" type="checkbox" checked class="w-4 h-4"> reseed
-            </label>
-            <button id="btnRngBytes" class="btn btn-ghost">GET /rng/bytes</button>
-            <button id="btnRngDownload" class="btn btn-primary">Download</button>
+      <h2 class="font-bold text-lg mb-3">DRBG Bytes</h2>
+      <div class="text-sm text-slate-600 mb-3">Fast binary endpoints: <code>/rng/bytes</code> y <code>/rng/u32.bin</code> (ver abajo).</div>
+      <div class="space-y-3">
+        <div class="flex flex-wrap gap-2 items-end">
+          <div class="grow min-w-[14rem]">
+            <label class="block text-sm font-medium">Bytes</label>
+            <input id="rngCount" type="number" value="1024" min="1" max="1048576" class="w-full mt-1 rounded-xl border-slate-300">
           </div>
-          <textarea id="rngHex" rows="5" class="w-full mono rounded-xl border-slate-300" placeholder="hex preview…"></textarea>
+          <label class="text-sm flex items-center gap-2">
+            <input id="rngReseed" type="checkbox" class="w-4 h-4"> reseed
+          </label>
+          <button id="btnRngBytes" class="btn btn-ghost">GET /rng/bytes</button>
+          <button id="btnRngDownload" class="btn btn-primary">Download</button>
         </div>
-        <div class="space-y-3">
-          <div class="flex gap-2 items-end">
-            <div>
-              <label class="block text-sm font-medium">min</label>
-              <input id="intMin" type="number" value="0" class="w-24 mt-1 rounded-xl border-slate-300">
-            </div>
-            <div>
-              <label class="block text-sm font-medium">max</label>
-              <input id="intMax" type="number" value="36" class="w-24 mt-1 rounded-xl border-slate-300">
-            </div>
-            <div class="grow">
-              <label class="block text-sm font-medium">count</label>
-              <input id="intCount" type="number" value="10" min="1" max="100000" class="w-full mt-1 rounded-xl border-slate-300">
-            </div>
-            <button id="btnInts" class="btn btn-ghost">GET /rng/ints (JSON)</button>
-            <button id="btnIntsBin" class="btn btn-primary">BIN (u32 LE)</button>
-          </div>
-          <textarea id="intsOut" rows="5" class="w-full mono rounded-xl border-slate-300" placeholder="[1, 5, 3, …]"></textarea>
-
-          <label class="block text-sm font-medium mt-2">Manual reseed (octet-stream)</label>
-          <input id="reseedFile" type="file" class="block w-full rounded-xl border-slate-300">
-          <button id="btnReseed" class="btn btn-primary mt-2">POST /rng/reseed</button>
-          <div id="reseedResult" class="text-sm text-slate-600 mt-2">—</div>
-        </div>
+        <textarea id="rngHex" rows="5" class="w-full mono rounded-xl border-slate-300" placeholder="hex preview…"></textarea>
+        <div class="text-xs text-slate-600">Time: <span id="rngTime">—</span> ms · Size: <span id="rngSize">—</span></div>
       </div>
-    
+    </section>
+
+    <!-- DRBG ints -->
+    <section class="card">
+      <h2 class="font-bold text-lg mb-3">DRBG Ints</h2>
+      <div class="space-y-3">
+        <div class="flex flex-wrap gap-3 items-end">
+          <div>
+            <label class="block text-sm font-medium">min</label>
+            <input id="intMin" type="number" value="0" class="w-24 mt-1 rounded-xl border-slate-300">
+          </div>
+          <div>
+            <label class="block text-sm font-medium">max</label>
+            <input id="intMax" type="number" value="36" class="w-24 mt-1 rounded-xl border-slate-300">
+          </div>
+          <div class="grow min-w-[14rem]">
+            <label class="block text-sm font-medium">count</label>
+            <input id="intCount" type="number" value="10" min="1" max="100000" class="w-full mt-1 rounded-xl border-slate-300">
+          </div>
+          <label class="text-sm flex items-center gap-2">
+            <input id="intsReseed" type="checkbox" class="w-4 h-4"> reseed
+          </label>
+          <button id="btnInts" class="btn btn-ghost">GET /rng/ints (JSON)</button>
+          <button id="btnIntsBin" class="btn btn-primary">BIN (u32 LE)</button>
+        </div>
+        <textarea id="intsOut" rows="5" class="w-full mono rounded-xl border-slate-300" placeholder="[1, 5, 3, …]"></textarea>
+        <div class="text-xs text-slate-600">Time: <span id="intsTime">—</span> ms · Count: <span id="intsCount">—</span> · Size: <span id="intsSize">—</span></div>
+      </div>
+    </section>
+
+    <!-- Manual reseed -->
+    <section class="card">
+      <h2 class="font-bold text-lg mb-3">Manual reseed</h2>
+      <div class="space-y-3">
+        <div>
+          <label class="block text-sm font-medium">Upload seed (octet-stream)</label>
+          <input id="reseedFile" type="file" class="block w-full rounded-xl border-slate-300">
+        </div>
+        <button id="btnReseed" class="btn btn-primary">POST /rng/reseed</button>
+        <div id="reseedResult" class="text-sm text-slate-600">—</div>
+      </div>
+    </section>
+
     <!-- High-throughput u32.bin -->
     <section class="card">
       <h2 class="font-bold text-lg mb-3">High-throughput u32 (binary)</h2>
       <div class="grid-2">
         <div class="space-y-3">
           <div class="flex gap-2 items-end">
-            <div class="grow">
+            <div class="grow min-w-[14rem]">
               <label class="block text-sm font-medium">Count (uint32)</label>
               <input id="u32Count" type="number" value="100000" min="1" max="25000000" class="w-full mt-1 rounded-xl border-slate-300">
             </div>
@@ -191,6 +224,9 @@
                 <option value="be">big-endian</option>
               </select>
             </div>
+            <label class="text-sm flex items-center gap-2">
+              <input id="u32Reseed" type="checkbox" class="w-4 h-4"> reseed
+            </label>
             <button id="btnU32Bin" class="btn btn-primary">GET /rng/u32.bin</button>
           </div>
           <div class="flex gap-6 mono">
@@ -209,8 +245,7 @@ const view = new DataView(buf);
 const first = view.getUint32(0, true); // LE</pre>
         </div>
       </div>
-    </section>
-</section>
+  </section>
 
   </main>
 
@@ -229,11 +264,11 @@ const first = view.getUint32(0, true); // LE</pre>
     const setStatus = (txt, ok=true) => {
       const el = $('#statusDot');
       el.textContent = txt;
-      el.className = 'pill ' + (ok ? 'bg-emerald-100 text-emerald-700' : 'bg-rose-100 text-rose-700');
+      el.className = 'pill ' + (ok ? 'bg-emerald-900 text-emerald-200' : 'bg-rose-900 text-rose-200');
     };
 
     // --- Sparkline simple ---
-    const spark = $('#spark'); const ctx = spark.getContext('2d');
+  const spark = $('#spark'); const ctx = spark.getContext('2d');
     const sparkData = [];
     function pushSpark(v){
       sparkData.push(v); if(sparkData.length>80) sparkData.shift();
@@ -248,17 +283,21 @@ const first = view.getUint32(0, true); // LE</pre>
         const y = h - norm(val)*h;
         i? ctx.lineTo(x,y) : ctx.moveTo(x,y);
       });
-      ctx.lineWidth = 2; ctx.strokeStyle = '#4f46e5'; ctx.stroke();
+  ctx.lineWidth = 2; ctx.strokeStyle = '#93c5fd'; ctx.stroke();
     }
 
     // --- API calls ---
     async function apiGet(path){
-      const res = await fetch(getBase()+path);
+      const k = ($('#apiKey') && $('#apiKey').value.trim()) || localStorage.getItem('aleamaris_api_key') || '';
+      const opts = k ? { headers: { 'X-API-Key': k } } : {};
+      const res = await fetch(getBase()+path, opts);
       if(!res.ok) throw new Error(res.status+' '+res.statusText);
       return res;
     }
     async function apiPost(path, body){
-      const res = await fetch(getBase()+path,{method:'POST', body});
+      const k = ($('#apiKey') && $('#apiKey').value.trim()) || localStorage.getItem('aleamaris_api_key') || '';
+      const headers = k ? { 'X-API-Key': k } : undefined;
+      const res = await fetch(getBase()+path,{method:'POST', body, headers});
       if(!res.ok) throw new Error(res.status+' '+res.statusText);
       return res;
     }
@@ -281,41 +320,55 @@ const first = view.getUint32(0, true); // LE</pre>
     }
 
     // --- RAW ---
-    $('#btnRawGet').onclick = async ()=>{
+  $('#btnRawGet').onclick = async ()=>{
       try{
         const n = Math.max(1, Math.min(4096, parseInt($('#rawCount').value||'0',10)));
-        const r = await apiGet('/trng/bytes?count='+n);
+    const t0 = performance.now();
+    const r = await apiGet('/trng/bytes?count='+n);
         const buf = await r.arrayBuffer();
+    const t1 = performance.now();
         $('#rawHex').value = toHexLimited(buf);
+    $('#rawTime').textContent = (t1 - t0).toFixed(2);
+    $('#rawSize').textContent = (buf.byteLength/1024).toFixed(2)+' KB';
         refreshStats();
       }catch(e){ alert(e.message); }
     };
     $('#btnRawDownload').onclick = async ()=>{
       try{
         const n = Math.max(1, Math.min(4096, parseInt($('#rawCount').value||'0',10)));
-        const r = await apiGet('/trng/bytes?count='+n);
+    const t0 = performance.now();
+    const r = await apiGet('/trng/bytes?count='+n);
         const blob = await r.blob();
+    const t1 = performance.now();
         download('raw.bin', blob); refreshStats();
+    $('#rawTime').textContent = (t1 - t0).toFixed(2);
+    $('#rawSize').textContent = (blob.size/1024).toFixed(2)+' KB';
       }catch(e){ alert(e.message); }
     };
     $('#btnIngest').onclick = async ()=>{
       const f = $('#ingFile').files[0]; if(!f){ alert('Select a file'); return; }
       try{
-        const r = await apiPost('/trng/ingest', f);
+  const t0 = performance.now();
+  const r = await apiPost('/trng/ingest', f);
         const j = await r.json();
-        $('#ingResult').textContent = `received=${j.received} dropped=${j.dropped} available=${j.available}`;
+  const t1 = performance.now();
+  $('#ingResult').textContent = `received=${j.received} dropped=${j.dropped} available=${j.available} · time=${(t1-t0).toFixed(2)} ms`;
         refreshStats();
       }catch(e){ alert(e.message); }
     };
 
     // --- DRBG ---
-    $('#btnRngBytes').onclick = async ()=>{
+  $('#btnRngBytes').onclick = async ()=>{
       try{
         const n = Math.max(1, Math.min(1048576, parseInt($('#rngCount').value||'0',10)));
-        const reseed = $('#rngReseed').checked ? 'true':'false';
-        const r = await apiGet(`/rng/bytes?count=${n}&reseed=${reseed}`);
+    const reseed = $('#rngReseed').checked ? 'true':'false';
+    const t0 = performance.now();
+    const r = await apiGet(`/rng/bytes?count=${n}&reseed=${reseed}`);
         const buf = await r.arrayBuffer();
+    const t1 = performance.now();
         $('#rngHex').value = toHexLimited(buf);
+    $('#rngTime').textContent = (t1 - t0).toFixed(2);
+    $('#rngSize').textContent = (buf.byteLength/1024).toFixed(2)+' KB';
         refreshStats();
       }catch(e){ alert(e.message); }
     };
@@ -323,27 +376,43 @@ const first = view.getUint32(0, true); // LE</pre>
       try{
         const n = Math.max(1, Math.min(1048576, parseInt($('#rngCount').value||'0',10)));
         const reseed = $('#rngReseed').checked ? 'true':'false';
-        const r = await apiGet(`/rng/bytes?count=${n}&reseed=${reseed}`);
+    const t0 = performance.now();
+    const r = await apiGet(`/rng/bytes?count=${n}&reseed=${reseed}`);
         const blob = await r.blob();
+    const t1 = performance.now();
         download('rng.bin', blob); refreshStats();
+    $('#rngTime').textContent = (t1 - t0).toFixed(2);
+    $('#rngSize').textContent = (blob.size/1024).toFixed(2)+' KB';
       }catch(e){ alert(e.message); }
     };
 
-    $('#btnInts').onclick = async ()=>{
+  $('#btnInts').onclick = async ()=>{
       try{
         const mi = parseInt($('#intMin').value,10), ma = parseInt($('#intMax').value,10), c = parseInt($('#intCount').value,10);
-        const r = await apiGet(`/rng/ints?min=${mi}&max=${ma}&count=${c}&reseed=true&fmt=json`);
+    const reseed = $('#intsReseed').checked ? 'true':'false';
+    const t0 = performance.now();
+    const r = await apiGet(`/rng/ints?min=${mi}&max=${ma}&count=${c}&reseed=${reseed}&fmt=json`);
         const j = await r.json();
+    const t1 = performance.now();
         $('#intsOut').value = JSON.stringify(j.values || [], null, 2);
+    $('#intsTime').textContent = (t1 - t0).toFixed(2);
+    $('#intsCount').textContent = (j.count ?? 0);
+    $('#intsSize').textContent = ((j.count ?? 0) * 4 / 1024).toFixed(2) + ' KB';
         refreshStats();
       }catch(e){ alert(e.message); }
     };
     $('#btnIntsBin').onclick = async ()=>{
       try{
         const mi = parseInt($('#intMin').value,10), ma = parseInt($('#intMax').value,10), c = parseInt($('#intCount').value,10);
-        const r = await apiGet(`/rng/ints?min=${mi}&max=${ma}&count=${c}&reseed=true&fmt=bin`);
+    const reseed = $('#intsReseed').checked ? 'true':'false';
+    const t0 = performance.now();
+    const r = await apiGet(`/rng/ints?min=${mi}&max=${ma}&count=${c}&reseed=${reseed}&fmt=bin`);
         const blob = await r.blob();
+    const t1 = performance.now();
         download('ints_u32le.bin', blob); refreshStats();
+    $('#intsTime').textContent = (t1 - t0).toFixed(2);
+    $('#intsCount').textContent = c;
+    $('#intsSize').textContent = (blob.size/1024).toFixed(2)+' KB';
       }catch(e){ alert(e.message); }
     };
 
@@ -351,17 +420,24 @@ const first = view.getUint32(0, true); // LE</pre>
     $('#btnReseed').onclick = async ()=>{
       const f = $('#reseedFile').files[0]; if(!f){ alert('Select a file'); return; }
       try{
-        const r = await apiPost('/rng/reseed', f);
+  const t0 = performance.now();
+  const r = await apiPost('/rng/reseed', f);
         const j = await r.json();
-        $('#reseedResult').textContent = `received=${j.received} status=${j.status}`;
+  const t1 = performance.now();
+  $('#reseedResult').textContent = `received=${j.received} status=${j.status} · time=${(t1-t0).toFixed(2)} ms`;
         refreshStats();
       }catch(e){ alert(e.message); }
     };
 
     // Base URL handling
-    $('#saveBase').onclick = ()=>{ localStorage.setItem('aleamaris_base', $('#apiBase').value.trim()); refreshStats(); };
+    $('#saveBase').onclick = ()=>{ 
+      localStorage.setItem('aleamaris_base', $('#apiBase').value.trim()); 
+      if($('#apiKey')) localStorage.setItem('aleamaris_api_key', $('#apiKey').value.trim());
+      refreshStats(); 
+    };
     $('#ping').onclick = refreshStats;
     const saved = localStorage.getItem('aleamaris_base'); if(saved) $('#apiBase').value = saved;
+    const savedKey = localStorage.getItem('aleamaris_api_key'); if(savedKey && $('#apiKey')) $('#apiKey').value = savedKey;
 
     // Auto refresh
     let timer = null;
@@ -379,12 +455,13 @@ const first = view.getUint32(0, true); // LE</pre>
 
     
     // --- High-throughput u32.bin ---
-    $('#btnU32Bin').onclick = async ()=>{
+  $('#btnU32Bin').onclick = async ()=>{
       try{
         const count = Math.max(1, Math.min(25_000_000, parseInt($('#u32Count').value||'0',10)));
         const endian = $('#u32Endian').value;
-        const t0 = performance.now();
-        const r = await apiGet(`/rng/u32.bin?count=${count}&endian=${endian}`);
+    const reseed = $('#u32Reseed').checked ? 'true':'false';
+    const t0 = performance.now();
+    const r = await apiGet(`/rng/u32.bin?count=${count}&endian=${endian}&reseed=${reseed}`);
         const buf = await r.arrayBuffer();
         const t1 = performance.now();
         // metrics
@@ -411,6 +488,95 @@ const first = view.getUint32(0, true); // LE</pre>
 
     // First paint
     refreshStats();
+
+    // --- Constellation animated background (replaces blobs) ---
+    (function(){
+      const canvas = document.getElementById('bgCanvas');
+      if(!canvas) return;
+      const ctx = canvas.getContext('2d');
+      const mq = window.matchMedia('(prefers-reduced-motion: reduce)');
+      const DPR = () => Math.min(window.devicePixelRatio||1, 2);
+      let w=0, h=0, dpr=1;
+
+      function resize(){
+        dpr = DPR();
+        w = canvas.width = Math.floor(canvas.clientWidth * dpr);
+        h = canvas.height = Math.floor(canvas.clientHeight * dpr);
+        initStars();
+      }
+      window.addEventListener('resize', resize);
+
+      // Partículas tipo "constelación"
+      let stars = [];
+      let linkDist = 0; // se calcula en init
+      const mouse = {x: -1, y: -1, active: false};
+      canvas.addEventListener('mousemove', (e)=>{
+        const rect = canvas.getBoundingClientRect();
+        mouse.x = (e.clientX - rect.left) * dpr;
+        mouse.y = (e.clientY - rect.top) * dpr;
+        mouse.active = true;
+      });
+      canvas.addEventListener('mouseleave', ()=>{ mouse.active = false; });
+
+      function initStars(){
+        const area = (w*h) / (dpr*dpr);
+        const targetCount = Math.max(60, Math.min(160, Math.floor(area * 0.00008)));
+        linkDist = Math.max(80, Math.min(180, Math.sqrt(area) * 0.08)) * dpr;
+        stars = Array.from({length: targetCount}, ()=>({
+          x: Math.random()*w,
+          y: Math.random()*h,
+          vx: (Math.random()*2-1) * (0.12*dpr),
+          vy: (Math.random()*2-1) * (0.12*dpr),
+          r: (Math.random()*0.8 + 0.4) * dpr,
+          a: 0.5 + Math.random()*0.5,
+        }));
+      }
+
+      function step(){
+        ctx.clearRect(0,0,w,h);
+        // estrellas
+        for(const s of stars){
+          if(!mq.matches){
+            s.x += s.vx; s.y += s.vy;
+            if(s.x < 0 || s.x > w) s.vx *= -1;
+            if(s.y < 0 || s.y > h) s.vy *= -1;
+            // leve atracción del puntero
+            if(mouse.active){
+              const dx = mouse.x - s.x, dy = mouse.y - s.y; const d2 = dx*dx + dy*dy;
+              if(d2 < (linkDist*linkDist)){
+                s.vx += dx * 0.000002; s.vy += dy * 0.000002;
+              }
+            }
+          }
+          // brillo
+          ctx.fillStyle = `hsla(210, 90%, 88%, ${0.35*s.a})`;
+          ctx.beginPath(); ctx.arc(s.x, s.y, s.r*2.2, 0, Math.PI*2); ctx.fill();
+          ctx.fillStyle = `hsla(210, 100%, 98%, ${0.85*s.a})`;
+          ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, Math.PI*2); ctx.fill();
+        }
+
+        // líneas entre vecinas
+        ctx.lineWidth = 0.9 * dpr;
+        for(let i=0;i<stars.length;i++){
+          for(let j=i+1;j<stars.length;j++){
+            const a = stars[i], b = stars[j];
+            const dx = a.x-b.x, dy = a.y-b.y; const dist = Math.hypot(dx,dy);
+            if(dist < linkDist){
+              const alpha = 1 - (dist/linkDist);
+              ctx.strokeStyle = `hsla(210, 80%, 84%, ${0.35*alpha})`;
+              ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+            }
+          }
+        }
+
+        if(!mq.matches) requestAnimationFrame(step);
+      }
+
+      resize();
+      initStars();
+      if(!mq.matches) requestAnimationFrame(step); else step();
+      mq.addEventListener?.('change', ()=>{ if(!mq.matches) requestAnimationFrame(step); else step(); });
+    })();
   </script>
 </body>
 </html>

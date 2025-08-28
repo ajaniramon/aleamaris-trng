@@ -30,16 +30,17 @@ middleware = [
 app = FastAPI(title="AleaMaris TRNG API", middleware=middleware)
 
 RAW_CAP               = int(os.environ.get("ALEAMARIS_RAW_CAP", "100000000"))
-BOOT_BYTES            = int(os.environ.get("ALEAMARIS_BOOT_BYTES", "65536"))
+BOOT_BYTES            = int(os.environ.get("ALEAMARIS_BOOT_BYTES", "4096"))
 ALLOW_URANDOM_BOOT    = os.environ.get("ALEAMARIS_ALLOW_URANDOM", "0").lower() in ("1","true","yes")
 VIDEO_PATH            = os.environ.get("ALEAMARIS_VIDEO", "sample2.mp4")
 CAM_INDEX             = int(os.environ.get("ALEAMARIS_CAM", "0"))
-FILL_LOW_WM           = int(os.environ.get("ALEAMARIS_RAW_LOW_WM",  "10000"))     # low watermark
-FILL_HIGH_WM          = int(os.environ.get("ALEAMARIS_RAW_HIGH_WM", "900000"))    # high watermark
+FILL_LOW_WM           = int(os.environ.get("ALEAMARIS_RAW_LOW_WM",  "2000"))     # low watermark
+FILL_HIGH_WM          = int(os.environ.get("ALEAMARIS_RAW_HIGH_WM", "5000"))    # high watermark
 FILL_INTERVAL_MS      = int(os.environ.get("ALEAMARIS_FILL_INTERVAL_MS", "200"))  # cada 200ms check
-FILL_CHUNK_BYTES      = int(os.environ.get("ALEAMARIS_FILL_CHUNK", "65536"))      # tamaño de aportes
-RESEED_PERIOD_SEC     = int(os.environ.get("ALEAMARIS_RESEED_PERIOD", "60"))      # reseed cada minuto
+FILL_CHUNK_BYTES      = int(os.environ.get("ALEAMARIS_FILL_CHUNK", "500"))      # tamaño de aportes
+RESEED_PERIOD_SEC     = int(os.environ.get("ALEAMARIS_RESEED_PERIOD", "120"))      # reseed cada minuto
 RESEED_BYTES          = int(os.environ.get("ALEAMARIS_RESEED_BYTES", "64"))       # bytes por reseed
+RESEED_INTERVAL_BYTES = int(os.environ.get("ALEAMARIS_RESEED_INTERVAL_BYTES", "1000000"))  # umbral de bytes antes de reseed
 API_KEY               = os.environ.get("ALEAMARIS_API_KEY")                       # opcional
 
 # Pipeline de features para “moler” frames a bytes (igual que tu CLI)
@@ -84,6 +85,7 @@ def _seed_provider(n: int) -> bytes:
     return b""  # dejar que el caller decida si petar
 
 _rng = AleaMaris(_seed_provider)  # DRBG ChaCha20 con reseed interval interno
+_rng.reseed_interval_bytes = RESEED_INTERVAL_BYTES
 _fill_task: asyncio.Task | None = None
 _reseed_task: asyncio.Task | None = None
 
@@ -99,6 +101,13 @@ def _reseed_from_queue(limit_bytes: int = RESEED_BYTES) -> int:
         _rng.reseed(data)
         return len(data)
     return 0
+
+def _maybe_reseed_opportunistic() -> None:
+    """Reseed sólo si el DRBG ya expandió suficiente (umbral interno)."""
+    try:
+        _rng.maybe_reseed()
+    except Exception:
+        pass
 
 async def _filler_loop():
     """Mantiene la cola RAW entre LOW y HIGH; usa vídeo/cam; si no hay y se permite, urandom; si no, espera."""
@@ -183,9 +192,12 @@ def health():
 
 @app.get("/rng/bytes")
 def rng_bytes(count: int = Query(default=256, ge=1, le=1_048_576),
-              reseed: bool = Query(default=True)):
+              reseed: bool = Query(default=False)):
+    # Reseed manual bajo demanda, si se pide; si no, oportunista
     if reseed:
         _reseed_from_queue()
+    else:
+        _maybe_reseed_opportunistic()
     data = _rng.random_bytes(count)
     return Response(content=data, media_type="application/octet-stream",
                     headers={"X-Count": str(len(data))})
@@ -194,12 +206,14 @@ def rng_bytes(count: int = Query(default=256, ge=1, le=1_048_576),
 def rng_ints(min: int = Query(default=0),
              max: int = Query(default=36),
              count: int = Query(default=10, ge=1, le=100_000),
-             reseed: bool = Query(default=True),
+             reseed: bool = Query(default=False),
              fmt: str = Query(default="json")):
     if min > max:
         return Response(status_code=400, content=b'{"error":"min>max"}', media_type="application/json")
     if reseed:
         _reseed_from_queue()
+    else:
+        _maybe_reseed_opportunistic()
     print(min)
     print(max)
     vals = [_rng.randint(min, max) for _ in range(count)]
@@ -241,9 +255,11 @@ def _u32bin_stream(count: int, endian="le", batch=100_000):
 @app.get("/rng/u32.bin")
 def rng_u32_bin(count: int = Query(100_000, ge=1, le=25_000_000),
                 endian: str = Query("le", pattern="^(le|be)$"),
-                reseed: bool = Query(default=True)):
+                reseed: bool = Query(default=False)):
     if reseed:
         _reseed_from_queue()
+    else:
+        _maybe_reseed_opportunistic()
     return StreamingResponse(
         _u32bin_stream(count, endian=endian),
         media_type="application/octet-stream",
@@ -262,9 +278,11 @@ def _u32jsonl_stream(count: int, batch=100_000):
 
 @app.get("/rng/u32.jsonl")
 def rng_u32_jsonl(count: int = Query(100_000, ge=1, le=2_000_000),
-                  reseed: bool = Query(default=True)):
+                  reseed: bool = Query(default=False)):
     if reseed:
         _reseed_from_queue()
+    else:
+        _maybe_reseed_opportunistic()
     return StreamingResponse(
         _u32jsonl_stream(count),
         media_type="application/x-ndjson",
