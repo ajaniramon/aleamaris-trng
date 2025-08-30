@@ -16,7 +16,7 @@ services:
       - ALEAMARIS_LOG_JSON=0
       - ALEAMARIS_LOG_FILE=/app/logs/aleamaris.log
     ports:
-      - "8080:8080"
+      - "50000:8080"
     volumes:
       - logs:/app/logs
     restart: unless-stopped
@@ -27,7 +27,7 @@ services:
       dockerfile: Dockerfile.web
     image: aleamaris-trng-web:latest
     ports:
-      - "8081:80"
+      - "50001:80"
     depends_on:
       - api
     restart: unless-stopped
