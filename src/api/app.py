@@ -1,6 +1,6 @@
 # api/app.py
 from __future__ import annotations
-import os, asyncio, struct
+import os, asyncio, struct, concurrent.futures, functools
 from fastapi import FastAPI, Request, Response, Header, Query
 from fastapi.responses import StreamingResponse
 from starlette.middleware import Middleware
@@ -42,6 +42,11 @@ RESEED_PERIOD_SEC     = int(os.environ.get("ALEAMARIS_RESEED_PERIOD", "120"))   
 RESEED_BYTES          = int(os.environ.get("ALEAMARIS_RESEED_BYTES", "64"))       # bytes por reseed
 RESEED_INTERVAL_BYTES = int(os.environ.get("ALEAMARIS_RESEED_INTERVAL_BYTES", "1000000"))  # umbral de bytes antes de reseed
 API_KEY               = os.environ.get("ALEAMARIS_API_KEY")                       # opcional
+BUF_CHUNK_BYTES       = int(os.environ.get("ALEAMARIS_BUF_CHUNK_BYTES", "262144"))   # 256 KiB por defecto para no bloquear la 1ª req
+WARM_AT_START_BYTES   = int(os.environ.get("ALEAMARIS_WARM_AT_START_BYTES", "262144"))  # calentar algo al arrancar
+WARM_PERIOD_SEC       = int(os.environ.get("ALEAMARIS_WARM_PERIOD_SEC", "30"))   # cada cuánto re-calentar
+WARM_TARGET_BYTES     = int(os.environ.get("ALEAMARIS_WARM_TARGET_BYTES", "4194304"))   # objetivo de bytes en buffer
+WARM_CHUNK_BYTES      = int(os.environ.get("ALEAMARIS_WARM_CHUNK_BYTES", "131072"))   # 128 KiB por iteración de warm
 
 # Pipeline de features para “moler” frames a bytes (igual que tu CLI)
 GEN_CFG = GenConfig(bytes_total=FILL_CHUNK_BYTES, resize=64, stride=1, use_diff=True, debug=False)
@@ -86,8 +91,11 @@ def _seed_provider(n: int) -> bytes:
 
 _rng = AleaMaris(_seed_provider)  # DRBG ChaCha20 con reseed interval interno
 _rng.reseed_interval_bytes = RESEED_INTERVAL_BYTES
+_rng.set_buffer_chunk_size(BUF_CHUNK_BYTES)
 _fill_task: asyncio.Task | None = None
 _reseed_task: asyncio.Task | None = None
+_warm_task: asyncio.Task | None = None
+_threadpool: concurrent.futures.ThreadPoolExecutor | None = None
 
 # -------------------- Helpers de reseed y fill --------------------
 def _reseed_from_queue(limit_bytes: int = RESEED_BYTES) -> int:
@@ -139,6 +147,22 @@ async def _reseed_loop():
             pass
         await asyncio.sleep(RESEED_PERIOD_SEC)
 
+async def _warm_loop():
+    """Calienta periódicamente el buffer del DRBG en un hilo aparte para no bloquear el event loop."""
+    # usamos un ThreadPoolExecutor chico dedicado
+    loop = asyncio.get_running_loop()
+    while True:
+        try:
+            # sólo si el buffer está por debajo del target calentamos
+            avail = _rng.buffer_available()
+            if avail < WARM_TARGET_BYTES:
+                # correr warm_buffer en thread, con chunk limitado para no pedir 4MiB de golpe si duele
+                fn = functools.partial(_rng.warm_buffer, WARM_TARGET_BYTES, chunk_size=WARM_CHUNK_BYTES)
+                await loop.run_in_executor(_threadpool, fn)
+        except Exception:
+            pass
+        await asyncio.sleep(WARM_PERIOD_SEC)
+
 @app.on_event("startup")
 async def _startup():
     print("startup called")
@@ -155,16 +179,29 @@ async def _startup():
     q.offer(boot)
 
     # 2) Lanza los procesos en background
-    global _fill_task, _reseed_task
+    global _fill_task, _reseed_task, _warm_task, _threadpool
     loop = asyncio.get_event_loop()
+    # threadpool pequeño para tareas de calentado
+    _threadpool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="drbg-warm")
     _fill_task = loop.create_task(_filler_loop())
     _reseed_task = loop.create_task(_reseed_loop())
+    # Precalentar algo del buffer del DRBG en thread sin bloquear el arranque
+    if WARM_AT_START_BYTES > 0:
+        try:
+            fn = functools.partial(_rng.warm_buffer, WARM_AT_START_BYTES, chunk_size=WARM_CHUNK_BYTES)
+            # no esperamos; se ejecuta en background
+            loop.run_in_executor(_threadpool, fn)
+        except Exception:
+            pass
+    _warm_task = loop.create_task(_warm_loop())
 
 @app.on_event("shutdown")
 async def _shutdown():
-    for task in (_fill_task, _reseed_task):
+    for task in (_fill_task, _reseed_task, _warm_task):
         if task:
             task.cancel()
+    if _threadpool:
+        _threadpool.shutdown(wait=False, cancel_futures=True)
 
 @app.post("/trng/ingest")
 async def ingest(request: Request, x_api_key: str | None = Header(default=None)):
@@ -295,6 +332,9 @@ def rng_stats():
     return {
         "generated_bytes_since_last_reseed": _rng.generated,
         "reseed_interval_bytes": _rng.reseed_interval_bytes,
+    "buffer_available": _rng.buffer_available(),
+    "buffer_chunk_bytes": BUF_CHUNK_BYTES,
+    "warm_target_bytes": WARM_TARGET_BYTES,
         "raw_available": q.available(),
         "boot_bytes": BOOT_BYTES,
         "allow_urandom_boot": ALLOW_URANDOM_BOOT,

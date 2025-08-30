@@ -98,6 +98,13 @@
             <div id="rawBar" class="bg-indigo-500 h-2 rounded" style="width:0%"></div>
           </div>
           <canvas id="spark" class="spark mt-2"></canvas>
+          <div class="mt-5"></div>
+          <div class="text-sm text-slate-600">DRBG buffer available</div>
+          <div class="mono text-xl" id="bufAvail">—</div>
+          <div class="w-full bg-slate-200 rounded mt-2">
+            <div id="bufBar" class="bg-emerald-500 h-2 rounded" style="width:0%"></div>
+          </div>
+          <canvas id="bufSpark" class="spark mt-2"></canvas>
         </div>
         <div class="grid grid-cols-2 gap-3">
           <div>
@@ -115,6 +122,14 @@
           <div>
             <div class="text-sm text-slate-600">Reseed size</div>
             <div class="mono text-xl"><span id="reseedBytes">—</span> B</div>
+          </div>
+          <div>
+            <div class="text-sm text-slate-600">Buffer target</div>
+            <div class="mono text-xl" id="warmTarget">—</div>
+          </div>
+          <div>
+            <div class="text-sm text-slate-600">Buffer chunk</div>
+            <div class="mono text-xl" id="bufChunk">—</div>
           </div>
         </div>
       </div>
@@ -267,23 +282,34 @@ const first = view.getUint32(0, true); // LE</pre>
       el.className = 'pill ' + (ok ? 'bg-emerald-900 text-emerald-200' : 'bg-rose-900 text-rose-200');
     };
 
-    // --- Sparkline simple ---
-  const spark = $('#spark'); const ctx = spark.getContext('2d');
-    const sparkData = [];
-    function pushSpark(v){
-      sparkData.push(v); if(sparkData.length>80) sparkData.shift();
-      const w = spark.width = spark.clientWidth, h = spark.height = spark.clientHeight;
+    // --- Sparklines simples (RAW y DRBG buffer) ---
+    function drawSpark(canvas, ctx, data, color){
+      const w = canvas.width = canvas.clientWidth, h = canvas.height = canvas.clientHeight;
       ctx.clearRect(0,0,w,h);
-      if(!sparkData.length) return;
-      const max = Math.max(...sparkData), min = Math.min(...sparkData);
+      if(!data.length) return;
+      const max = Math.max(...data), min = Math.min(...data);
       const norm = x => (max===min? 0.5 : (x-min)/(max-min));
       ctx.beginPath();
-      sparkData.forEach((val,i)=>{
-        const x = i*(w/(sparkData.length-1||1));
+      data.forEach((val,i)=>{
+        const x = i*(w/(data.length-1||1));
         const y = h - norm(val)*h;
         i? ctx.lineTo(x,y) : ctx.moveTo(x,y);
       });
-  ctx.lineWidth = 2; ctx.strokeStyle = '#93c5fd'; ctx.stroke();
+      ctx.lineWidth = 2; ctx.strokeStyle = color; ctx.stroke();
+    }
+    // RAW spark
+    const spark = $('#spark'); const ctx = spark.getContext('2d');
+    const sparkData = [];
+    function pushSpark(v){
+      sparkData.push(v); if(sparkData.length>80) sparkData.shift();
+      drawSpark(spark, ctx, sparkData, '#93c5fd');
+    }
+    // Buffer spark
+    const bufSpark = $('#bufSpark'); const bctx = bufSpark.getContext('2d');
+    const bufData = [];
+    function pushSparkBuf(v){
+      bufData.push(v); if(bufData.length>80) bufData.shift();
+      drawSpark(bufSpark, bctx, bufData, '#34d399');
     }
 
     // --- API calls ---
@@ -305,10 +331,21 @@ const first = view.getUint32(0, true); // LE</pre>
     async function refreshStats(){
       try{
         const r = await apiGet('/rng/stats'); const j = await r.json();
+        // RAW queue
         $('#rawAvail').textContent = j.raw_available ?? '—';
         pushSpark(j.raw_available||0);
         const pct = Math.max(0, Math.min(100, (j.raw_available/(j.fill_high_wm||1))*100));
         $('#rawBar').style.width = pct.toFixed(1)+'%';
+        // DRBG buffer
+        const bufAvail = j.buffer_available ?? 0;
+        const warmTarget = j.warm_target_bytes ?? 0;
+        $('#bufAvail').textContent = bufAvail;
+        $('#warmTarget').textContent = warmTarget;
+        $('#bufChunk').textContent = j.buffer_chunk_bytes ?? '—';
+        const bpct = warmTarget>0 ? Math.max(0, Math.min(100, (bufAvail/warmTarget)*100)) : 0;
+        $('#bufBar').style.width = bpct.toFixed(1)+'%';
+        pushSparkBuf(bufAvail||0);
+        // DRBG reseed metrics
         $('#genSince').textContent = j.generated_bytes_since_last_reseed ?? '—';
         $('#reseedInt').textContent = j.reseed_interval_bytes ?? '—';
         $('#reseedPeriod').textContent = j.reseed_period_sec ?? '—';
