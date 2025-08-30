@@ -1,0 +1,37 @@
+version: "3.9"
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: aleamaris-trng-api:latest
+    environment:
+      # Fuente de vídeo por defecto; puedes sobreescribir con una ruta válida dentro del contenedor
+      - ALEAMARIS_VIDEO=/app/sample.MP4
+      # Permitir urandom para no bloquear si no hay vídeo/cámara en el entorno
+      - ALEAMARIS_ALLOW_URANDOM=1
+      # Logging estilo log4j en texto y persistencia a volumen
+      - ALEAMARIS_LOG_LEVEL=INFO
+      - ALEAMARIS_LOG_JSON=0
+      - ALEAMARIS_LOG_FILE=/app/logs/aleamaris.log
+    ports:
+      - "8080:8080"
+    volumes:
+      - logs:/app/logs
+    restart: unless-stopped
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    image: aleamaris-trng-web:latest
+    ports:
+      - "8081:80"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  logs:
+    driver: local
