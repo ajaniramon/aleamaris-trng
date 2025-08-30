@@ -6,6 +6,9 @@ from .utils import dump_debug
 import struct, secrets, hmac, hashlib
 import cv2
 import numpy as np
+from .logging import get_logger
+
+log = get_logger("trng.generator")
 
 def hkdf_mix(key: bytes, data: bytes, out_len: int = 32) -> bytes:
     """
@@ -170,7 +173,7 @@ class TRNGGenerator:
             finally:
                 self.source.release()
 
-            print(f"gen: Video processed (seekable). Generated {len(produced)} bytes")
+            log.info("video processed seekable", extra={"generated_bytes": len(produced), "pass_counter": self.pass_counter, "global_counter": self.global_counter})
             return bytes(produced)
 
         # Ruta 2: fuente no seekable (cámara o lectura lineal)
@@ -182,7 +185,7 @@ class TRNGGenerator:
                 frame = self.source.read()
                 if frame is None:
                     # rebobina si es fichero (si tiene rewind); en cámara no hace nada
-                    print("gen: rewinding/non-seekable source loop.")
+                    log.debug("rewind or loop non-seekable source")
                     self.source.rewind()
                     prev_small = None
                     self.pass_counter += 1
@@ -214,5 +217,5 @@ class TRNGGenerator:
         finally:
             self.source.release()
 
-        print(f"gen: Video processed (linear). Generated {len(produced)} bytes")
+        log.info("video processed linear", extra={"generated_bytes": len(produced), "pass_counter": self.pass_counter, "global_counter": self.global_counter})
         return bytes(produced)

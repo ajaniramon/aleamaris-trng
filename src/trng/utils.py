@@ -32,6 +32,8 @@ def dump_debug(frame_idx: int,
                stride: int,
                use_diff: bool,
                prev_gray_small: Optional[np.ndarray]):
+    from .logging import get_logger
+    log = get_logger("trng.debug")
     base = f"f{frame_idx:05d}"
     if HAVE_PIL:
         from PIL import Image
@@ -65,3 +67,4 @@ def dump_debug(frame_idx: int,
     }
     with open(f"{base}_40_report.json", "w") as f:
         json.dump(rep, f, indent=2)
+    log.debug("debug artifacts dumped", extra={"frame": frame_idx, "base": base})

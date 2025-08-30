@@ -11,6 +11,8 @@ from trng.sources import FileVideoSource, CameraVideoSource
 from trng.generator import TRNGGenerator
 from trng.alea import AleaMaris
 from starlette.middleware.cors import CORSMiddleware
+import logging, uuid
+from trng.logging import setup_logging, get_logger, request_id_ctx
 
 
 middleware = [
@@ -28,6 +30,8 @@ middleware = [
 ]
 
 app = FastAPI(title="AleaMaris TRNG API", middleware=middleware)
+_log_root = setup_logging()
+log = get_logger("api")
 
 RAW_CAP               = int(os.environ.get("ALEAMARIS_RAW_CAP", "100000000"))
 BOOT_BYTES            = int(os.environ.get("ALEAMARIS_BOOT_BYTES", "4096"))
@@ -57,14 +61,14 @@ q = TrngQueue(cap_bytes=RAW_CAP)
 def _try_bytes_from_video_or_cam(n: int) -> bytes:
     """Intenta sacar n bytes desde VIDEO y/o CAM. Rebobina si es fichero."""
     if VIDEO_PATH:
-        print("video dump started")
+        log.info("video source attempt", extra={"path": VIDEO_PATH, "bytes": n})
         try:
             src = FileVideoSource(VIDEO_PATH)
             gen = TRNGGenerator(src, GEN_CFG)
             GEN_CFG.bytes_total = n
             return gen.produce()
         except Exception:
-            pass
+            log.warning("video source failed; will try camera if enabled", extra={"path": VIDEO_PATH})
     # Si no hay vídeo o falló, intenta cámara si el env lo dice
     if os.environ.get("ALEAMARIS_USE_CAM", "0").lower() in ("1","true","yes"):
         try:
@@ -73,7 +77,7 @@ def _try_bytes_from_video_or_cam(n: int) -> bytes:
             GEN_CFG.bytes_total = n
             return gen.produce()
         except Exception:
-            pass
+            log.warning("camera source failed", extra={"cam_index": CAM_INDEX})
     return b""
 
 def _seed_provider(n: int) -> bytes:
@@ -128,11 +132,11 @@ async def _filler_loop():
                 if not chunk and ALLOW_URANDOM_BOOT:
                     chunk = os.urandom(need_total)
                 if chunk:
-                    print(f"filler: Offered {len(chunk)} to queue")
+                    log.debug("filler offered to queue", extra={"offered": len(chunk), "available_before": avail})
                     q.offer(chunk)
         except Exception as e:
             # No tiramos la app por fallos de cámara/vídeo; reintentamos en la próxima vuelta
-            print(f"filler: failed with exception {e}")
+            log.error("filler loop error", extra={"error": str(e)})
             pass
         await asyncio.sleep(FILL_INTERVAL_MS / 1000.0)
 
@@ -160,23 +164,24 @@ async def _warm_loop():
                 fn = functools.partial(_rng.warm_buffer, WARM_TARGET_BYTES, chunk_size=WARM_CHUNK_BYTES)
                 await loop.run_in_executor(_threadpool, fn)
         except Exception:
-            pass
+            log.warning("warm loop error", exc_info=True)
         await asyncio.sleep(WARM_PERIOD_SEC)
 
 @app.on_event("startup")
 async def _startup():
-    print("startup called")
+    log.info("startup called")
 
     # 1) Boot: intentar poblar la RAW con BOOT_BYTES
     boot = _try_bytes_from_video_or_cam(BOOT_BYTES)
     if not boot and ALLOW_URANDOM_BOOT:
-        print("boot falling back to urandom")
+        log.warning("boot falling back to urandom")
         boot = os.urandom(BOOT_BYTES)
     if not boot:
         # requisito: “si no hay vídeo/cam y no se permite urandom → PETA”
         raise RuntimeError("AleaMaris: no entropy source available at startup and ALLOW_URANDOM disabled")
 
     q.offer(boot)
+    log.info("boot entropy queued", extra={"bytes": len(boot), "raw_available": q.available()})
 
     # 2) Lanza los procesos en background
     global _fill_task, _reseed_task, _warm_task, _threadpool
@@ -192,8 +197,9 @@ async def _startup():
             # no esperamos; se ejecuta en background
             loop.run_in_executor(_threadpool, fn)
         except Exception:
-            pass
+          log.warning("warm at start failed", exc_info=True)
     _warm_task = loop.create_task(_warm_loop())
+    log.info("background tasks started", extra={"fill_period_ms": FILL_INTERVAL_MS, "reseed_period_s": RESEED_PERIOD_SEC})
 
 @app.on_event("shutdown")
 async def _shutdown():
@@ -202,6 +208,7 @@ async def _shutdown():
             task.cancel()
     if _threadpool:
         _threadpool.shutdown(wait=False, cancel_futures=True)
+    log.info("shutdown completed")
 
 @app.post("/trng/ingest")
 async def ingest(request: Request, x_api_key: str | None = Header(default=None)):
@@ -210,6 +217,7 @@ async def ingest(request: Request, x_api_key: str | None = Header(default=None))
     data = await request.body()
     written = q.offer(data)
     dropped = len(data) - written
+    log.info("ingest", extra={"received": written, "dropped": dropped, "available": q.available()})
     return {"received": written, "dropped": dropped, "available": q.available()}
 
 @app.get("/trng/bytes")
@@ -217,6 +225,7 @@ def get_bytes(count: int = 256):
     c = max(1, min(count, 4096))
     out = q.poll(c)
     headers = {"X-Available-After": str(q.available())}
+    log.debug("trng bytes", extra={"requested": count, "served": len(out), "available_after": q.available()})
     return Response(content=out, media_type="application/octet-stream", headers=headers)
 
 @app.get("/trng/raw")
@@ -225,7 +234,9 @@ def get_raw(count: int = 256):
 
 @app.get("/trng/health")
 def health():
-    return {"available": q.available(), "status": "ok"}
+    avail = q.available()
+    log.debug("health", extra={"available": avail})
+    return {"available": avail, "status": "ok"}
 
 @app.get("/rng/bytes")
 def rng_bytes(count: int = Query(default=256, ge=1, le=1_048_576),
@@ -236,6 +247,7 @@ def rng_bytes(count: int = Query(default=256, ge=1, le=1_048_576),
     else:
         _maybe_reseed_opportunistic()
     data = _rng.random_bytes(count)
+    log.debug("rng bytes", extra={"count": count})
     return Response(content=data, media_type="application/octet-stream",
                     headers={"X-Count": str(len(data))})
 
@@ -251,8 +263,7 @@ def rng_ints(min: int = Query(default=0),
         _reseed_from_queue()
     else:
         _maybe_reseed_opportunistic()
-    print(min)
-    print(max)
+    log.debug("rng ints request", extra={"min": min, "max": max, "count": count, "fmt": fmt})
     vals = [_rng.randint(min, max) for _ in range(count)]
     if fmt == "bin":
         payload = b"".join(struct.pack("<I", v) for v in vals)
@@ -297,6 +308,7 @@ def rng_u32_bin(count: int = Query(100_000, ge=1, le=25_000_000),
         _reseed_from_queue()
     else:
         _maybe_reseed_opportunistic()
+    log.debug("rng u32 bin", extra={"count": count, "endian": endian})
     return StreamingResponse(
         _u32bin_stream(count, endian=endian),
         media_type="application/octet-stream",
@@ -320,6 +332,7 @@ def rng_u32_jsonl(count: int = Query(100_000, ge=1, le=2_000_000),
         _reseed_from_queue()
     else:
         _maybe_reseed_opportunistic()
+    log.debug("rng u32 jsonl", extra={"count": count})
     return StreamingResponse(
         _u32jsonl_stream(count),
         media_type="application/x-ndjson",
@@ -329,7 +342,7 @@ def rng_u32_jsonl(count: int = Query(100_000, ge=1, le=2_000_000),
 
 @app.get("/rng/stats")
 def rng_stats():
-    return {
+    rep = {
         "generated_bytes_since_last_reseed": _rng.generated,
         "reseed_interval_bytes": _rng.reseed_interval_bytes,
     "buffer_available": _rng.buffer_available(),
@@ -343,3 +356,19 @@ def rng_stats():
         "reseed_period_sec": RESEED_PERIOD_SEC,
         "reseed_bytes": RESEED_BYTES
     }
+    log.debug("rng stats", extra={"raw_available": rep["raw_available"], "buffer_available": rep["buffer_available"]})
+    return rep
+
+# -------- Middleware de correlación de request_id --------
+@app.middleware("http")
+async def add_request_id(request: Request, call_next):
+    rid = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+    token = request_id_ctx.set(rid)
+    try:
+        log.debug("request start", extra={"method": request.method, "path": request.url.path})
+        resp: Response = await call_next(request)
+        resp.headers["X-Request-ID"] = rid
+        log.debug("request end", extra={"status": resp.status_code})
+        return resp
+    finally:
+        request_id_ctx.reset(token)
