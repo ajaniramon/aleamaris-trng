@@ -17,12 +17,13 @@ class TrngQueue:
         self.total_in = 0
         self.total_out = 0
 
-    def offer(self, data: bytes) -> int:
-        """Append as much of `data` as fits. Returns bytes accepted."""
+    def offer(self, data: bytes, *, align: int = 1) -> int:
+        """Append as much of `data` as fits, in whole multiples of `align`
+        (so conditioned blocks are never cut). Returns bytes accepted."""
         if not data:
             return 0
         with self._lock:
-            room = self.cap - self._size
+            room = (self.cap - self._size) // align * align
             if room <= 0:
                 return 0
             chunk = bytes(data[:room])

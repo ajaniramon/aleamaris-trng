@@ -110,3 +110,27 @@ def test_module_level_helpers():
     rb = os.urandom
     assert 0 <= randbelow(rb, 10) < 10
     assert randints(rb, 0, 1, 10).size == 10
+
+
+def test_child_stream_counts_toward_parent_reseed():
+    calls = []
+
+    def src(n):
+        calls.append(n)
+        return b"e" * n
+
+    r = make(reseed_interval_bytes=1 << 20, entropy_source=src)
+    child = r.fork()
+    child.generate(5 << 20)  # 5 MiB through the child
+    assert child.rekeys >= 4
+    assert r.reseed_count >= 4 and len(calls) >= 4
+
+
+def test_child_picks_up_parent_reseed():
+    seed = os.urandom(48)
+    a, b = AleaMaris(seed, reseed_interval_bytes=1 << 20), AleaMaris(seed, reseed_interval_bytes=1 << 20)
+    ca, cb = a.fork(), b.fork()
+    assert ca.generate(1 << 20) == cb.generate(1 << 20)
+    b.reseed(b"fresh")
+    # after the next re-key the streams diverge
+    assert ca.generate(1 << 20) != cb.generate(1 << 20)

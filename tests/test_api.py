@@ -180,3 +180,21 @@ def test_reseed_query_uses_trng(c):
 
 def test_request_id_header(c):
     assert c.get("/trng/health", headers={"X-Request-ID": "abc"}).headers["x-request-id"] == "abc"
+
+
+def test_health_degraded_when_frames_stall(c):
+    col = c.app.state.collector
+    saved = col.last_frame_at
+    col.last_frame_at = time.monotonic() - 3600
+    try:
+        assert c.get("/trng/health").json()["status"] == "degraded"
+    finally:
+        col.last_frame_at = saved
+
+
+def test_demo_header_only_for_recordings(c):
+    deadline = time.time() + 10
+    while c.get("/trng/health").json()["available"] < 32 and time.time() < deadline:
+        time.sleep(0.05)
+    r = c.get("/trng/bytes?count=32")
+    assert r.status_code == 200 and "x-trng-demo" not in r.headers

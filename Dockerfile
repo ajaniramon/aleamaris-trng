@@ -1,9 +1,10 @@
 # AleaMaris TRNG — Dockerfile
-# FastAPI + uvicorn. Containers usually have no camera, so by default this runs
-# the *demo* pipeline on sample.MP4 (a recording: its output is NOT secret) and
-# lets the DRBG fall back to os.urandom once the video is used up.
-# For a real TRNG, pass a camera through (--device /dev/video0) and set
-# ALEAMARIS_USE_CAM=1, ALEAMARIS_CREDIT_FILE_SOURCE=0.
+# FastAPI + uvicorn. Containers usually have no camera, so by default the
+# collector runs on sample.MP4 *without crediting it* (a recording is not
+# entropy): /trng/bytes answers 503 and the DRBG is seeded from os.urandom.
+# - Real TRNG: pass a camera through (--device /dev/video0), ALEAMARIS_USE_CAM=1.
+# - Pipeline demo: ALEAMARIS_CREDIT_FILE_SOURCE=1 (output is reproducible and
+#   /trng/bytes marks it with an X-TRNG-Demo header).
 
 FROM python:3.11-slim AS runtime
 
@@ -19,7 +20,7 @@ COPY src ./src
 COPY sample.MP4 /app/sample.MP4
 
 ENV ALEAMARIS_VIDEO=/app/sample.MP4 \
-    ALEAMARIS_CREDIT_FILE_SOURCE=1 \
+    ALEAMARIS_CREDIT_FILE_SOURCE=0 \
     ALEAMARIS_ALLOW_URANDOM=1
 
 EXPOSE 8080

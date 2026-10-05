@@ -14,6 +14,7 @@ tested and recovers on its own if the noise comes back).
 """
 from __future__ import annotations
 
+import hashlib
 import math
 import threading
 import time
@@ -45,6 +46,7 @@ class EntropyCollector:
                  credit_non_physical: bool = False,
                  max_consecutive_failures: int = 30,
                  reopen_delay_sec: float = 5.0,
+                 max_read_failures: int = 30,
                  raw_sink: Optional[Callable[[bytes], None]] = None):
         self.source_factory = source_factory
         self.pool = pool
@@ -54,6 +56,7 @@ class EntropyCollector:
         self.credit_non_physical = credit_non_physical
         self.max_consecutive_failures = max_consecutive_failures
         self.reopen_delay_sec = reopen_delay_sec
+        self.max_read_failures = max_read_failures
         self.raw_sink = raw_sink
 
         self.source: Optional[VideoSource] = None
@@ -61,6 +64,7 @@ class EntropyCollector:
         self.source_physical: Optional[bool] = None
         self._prev: Optional[np.ndarray] = None
         self._block_counter = 0
+        # fingerprints of raw sample chunks (no counter), to catch replayed input
         self._recent_blocks: OrderedDict[bytes, None] = OrderedDict()
         self._recent_cap = 65536
         self._stop = threading.Event()
@@ -74,7 +78,10 @@ class EntropyCollector:
         self.tiles = 0
         self.tiles_passed = 0
         self.consecutive_failures = 0
+        self.consecutive_read_failures = 0
+        self.last_frame_at: Optional[float] = None
         self.blocks = 0
+        self.blocks_dropped_pool_full = 0
         self.duplicate_blocks = 0
         self.bits_credited = 0.0
         self.last_h_estimate: Optional[float] = None
@@ -113,8 +120,9 @@ class EntropyCollector:
         return self.source_physical is not None and (self.source_physical or self.credit_non_physical)
 
     # ---------- core ----------
-    def process_samples(self, samples: np.ndarray, *, credit: bool = True) -> list[bytes]:
-        """Health-test one batch of samples and return conditioned 32-byte blocks."""
+    def process_samples(self, samples: np.ndarray, *, credit: bool = True) -> list[tuple[bytes, float]]:
+        """Health-test one batch of samples and return (32-byte block, credited bits)
+        pairs. Credit is only booked by admit(), once a block is in the pool."""
         if self.raw_sink is not None:
             self.raw_sink(samples.tobytes())
         res = self.tester.check(samples)
@@ -144,21 +152,35 @@ class EntropyCollector:
         per_block = math.ceil(self.bits_per_block / h)
         out = []
         for i in range(good.size // per_block):
-            block = sha256_condition(good[i * per_block:(i + 1) * per_block].tobytes(), self._block_counter)
-            self._block_counter += 1
-            if self._seen(block):
+            chunk = good[i * per_block:(i + 1) * per_block].tobytes()
+            if self._seen(chunk):
                 # cannot happen with real noise; a replayed source would trigger it
                 self.duplicate_blocks += 1
                 continue
-            out.append(block)
-            self.bits_credited += per_block * h
-        self.blocks += len(out)
+            out.append((sha256_condition(chunk, self._block_counter), per_block * h))
+            self._block_counter += 1
         return out
 
-    def _seen(self, block: bytes) -> bool:
-        if block in self._recent_blocks:
+    def admit(self, blocks: list[tuple[bytes, float]]) -> int:
+        """Offer whole blocks to the pool; credit only those actually admitted."""
+        room = self.pool.free() // BLOCK_BYTES
+        fit = blocks[:room]
+        self.blocks_dropped_pool_full += len(blocks) - len(fit)
+        if not fit:
+            return 0
+        accepted = self.pool.offer(b"".join(b for b, _ in fit), align=BLOCK_BYTES)
+        n = accepted // BLOCK_BYTES
+        self.blocks += n
+        self.bits_credited += sum(bits for _, bits in fit[:n])
+        return accepted
+
+    def _seen(self, chunk: bytes) -> bool:
+        # fingerprint the raw samples only: the conditioning counter must not
+        # make a replayed chunk look new
+        fp = hashlib.sha256(chunk).digest()[:16]
+        if fp in self._recent_blocks:
             return True
-        self._recent_blocks[block] = None
+        self._recent_blocks[fp] = None
         if len(self._recent_blocks) > self._recent_cap:
             self._recent_blocks.popitem(last=False)
         return False
@@ -176,17 +198,26 @@ class EntropyCollector:
                     log.info("entropy source exhausted", extra={"source": self.source.name})
                     self.close()
                     return -1
+                self.consecutive_read_failures += 1
+                if self.consecutive_read_failures >= self.max_read_failures:
+                    # live camera stopped delivering: report it and reopen later
+                    self.state = "unavailable"
+                    self.last_error = "camera returned no frames"
+                    log.warning("entropy source stopped delivering frames; reopening",
+                                extra={"source": self.source.name})
+                    self.close()
+                    self.consecutive_read_failures = 0
+                    return -1
                 return 0
+            self.consecutive_read_failures = 0
+            self.last_frame_at = time.monotonic()
             gray = to_gray(frame)
             prev, self._prev = self._prev, gray
             if prev is None or prev.shape != gray.shape:
                 return 0
             samples = diff_samples(gray, prev, self.max_samples)
             blocks = self.process_samples(samples, credit=self.credited)
-        data = b"".join(blocks)
-        if data:
-            self.pool.offer(data)
-        return len(data)
+            return self.admit(blocks)
 
     # ---------- background thread ----------
     def start(self) -> None:
@@ -238,7 +269,10 @@ class EntropyCollector:
             "frames": self.frames,
             "frames_failed": self.frames_failed,
             "tile_pass_rate": round(self.tiles_passed / self.tiles, 4) if self.tiles else None,
+            "seconds_since_last_frame": (round(time.monotonic() - self.last_frame_at, 3)
+                                         if self.last_frame_at is not None else None),
             "blocks": self.blocks,
+            "blocks_dropped_pool_full": self.blocks_dropped_pool_full,
             "duplicate_blocks": self.duplicate_blocks,
             "bits_credited": round(self.bits_credited),
             "last_error": self.last_error,

@@ -14,8 +14,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Res
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.middleware.cors import CORSMiddleware
 
-from trng.alea import INT64_MAX, INT64_MIN, AleaMaris, randbelow, randints
-from trng.chacha_drbg import ChaCha20DRBG
+from trng.alea import INT64_MAX, INT64_MIN, AleaMaris, ChildDRBG, randbelow, randints
 from trng.config import Settings
 from trng.feeders import ReseedFeeder
 from trng.generator import EntropyCollector
@@ -29,6 +28,7 @@ log = get_logger("api")
 SEED_BYTES = 48
 MAX_BIGINT_COUNT = 10_000  # ranges beyond int64 use the scalar (arbitrary precision) path
 NDJSON_BATCH = 65_536
+STALL_SEC = 10.0
 
 
 def default_source_factory(settings: Settings) -> Optional[Callable[[], VideoSource]]:
@@ -80,7 +80,7 @@ class _Guarded:
     __del__ = close
 
 
-def _byte_chunks(drbg: ChaCha20DRBG, total: int, chunk: int) -> Iterator[bytes]:
+def _byte_chunks(drbg: ChildDRBG, total: int, chunk: int) -> Iterator[bytes]:
     remaining = total
     while remaining > 0:
         take = min(chunk, remaining)
@@ -88,7 +88,7 @@ def _byte_chunks(drbg: ChaCha20DRBG, total: int, chunk: int) -> Iterator[bytes]:
         remaining -= take
 
 
-def _int_batches(drbg: ChaCha20DRBG, lo: int, hi: int, count: int, batch: int) -> Iterator[np.ndarray]:
+def _int_batches(drbg: ChildDRBG, lo: int, hi: int, count: int, batch: int) -> Iterator[np.ndarray]:
     remaining = count
     while remaining > 0:
         take = min(batch, remaining)
@@ -167,7 +167,7 @@ def create_app(settings: Optional[Settings] = None,
         allow_credentials=False,
         allow_methods=["GET", "POST"],
         allow_headers=["*"],
-        expose_headers=["X-Count", "X-Dtype", "X-Available-After", "X-Request-ID"],
+        expose_headers=["X-Count", "X-Dtype", "X-TRNG-Demo", "X-Available-After", "X-Request-ID"],
     )
 
     def rng() -> AleaMaris:
@@ -229,8 +229,11 @@ def create_app(settings: Optional[Settings] = None,
             return JSONResponse(status_code=503, headers={"Retry-After": "1"}, content={
                 "error": "not enough TRNG entropy available yet",
                 "available": pool.available(), "requested": count, "source_state": collector.state})
-        return Response(content=out, media_type="application/octet-stream",
-                        headers={"X-Count": str(len(out)), "X-Available-After": str(pool.available())})
+        headers = {"X-Count": str(len(out)), "X-Available-After": str(pool.available())}
+        if not collector.source_physical:
+            # demo mode only: bytes derived from a recording are reproducible
+            headers["X-TRNG-Demo"] = "recorded-source-not-secret"
+        return Response(content=out, media_type="application/octet-stream", headers=headers)
 
     @app.get("/trng/raw")
     def trng_raw(count: int = Query(default=256, ge=1)):
@@ -239,8 +242,11 @@ def create_app(settings: Optional[Settings] = None,
     @app.get("/trng/health")
     def health():
         st = collector.status()
+        stale = st["seconds_since_last_frame"]
         if st["state"] == "failed":
             status = "failed"
+        elif st["state"] == "running" and stale is not None and stale > STALL_SEC:
+            status = "degraded"  # source open but no frame lately (hung driver?)
         elif st["state"] == "running" and st["entropy_credited"]:
             # a recorded video in demo mode works, but its output is not secret
             status = "ok" if st["physical"] else "demo"

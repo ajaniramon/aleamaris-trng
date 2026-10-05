@@ -69,9 +69,8 @@ def test_recording_demo_mode_and_replay_detection():
     run(c, 10)
     first = pool.available()
     assert first > 0
-    # replaying the exact same recording gives the same blocks -> rejected
+    # replaying the same recording (block counter keeps going) -> rejected
     c.state = "idle"
-    c._block_counter = 0
     run(c, 10)
     assert pool.available() == first
     assert c.duplicate_blocks > 0
@@ -84,3 +83,42 @@ def test_background_thread_fills_pool_and_stops():
     assert c.wait_for(4096, timeout=10)
     c.stop()
     assert c._thread is None
+
+
+class DyingCamera(NoiseCamera):
+    """Live camera that stops delivering frames after a while (unplugged)."""
+
+    def __init__(self, good_frames=3):
+        super().__init__()
+        self.left = good_frames
+
+    def read(self):
+        self.left -= 1
+        return super().read() if self.left >= 0 else None
+
+
+def test_live_camera_that_stops_delivering_is_reported_and_reopened():
+    opened = []
+
+    def factory():
+        cam = DyingCamera()
+        opened.append(cam)
+        return cam
+
+    c = EntropyCollector(factory, TrngQueue(), max_read_failures=5)
+    results = [c.step() for _ in range(3 + 5)]
+    assert results[-1] == -1
+    assert c.state == "unavailable" and c.source is None
+    c.step()  # next attempt reopens the camera
+    assert len(opened) == 2 and c.state == "running"
+
+
+def test_pool_admits_whole_blocks_and_credits_only_those():
+    pool = TrngQueue(cap_bytes=100)  # room for 3 blocks + 4 stray bytes
+    c = EntropyCollector(lambda: NoiseCamera(), pool)
+    run(c, 3)
+    assert pool.available() == 96
+    st = c.status()
+    assert st["blocks"] == 3
+    assert 3 * 512 <= st["bits_credited"] < 4 * 512
+    assert st["blocks_dropped_pool_full"] > 0

@@ -35,12 +35,14 @@ camera frame ─► temporal diff per pixel (native res, sparse grid) ─► raw
   driver), the health tests fail and output **stops**; it does not keep producing random-looking
   bytes.
 - **Recorded videos are not entropy.** Anyone with the file can replay it. A video can still be used
-  as a **demo** (`ALEAMARIS_CREDIT_FILE_SOURCE=1` / `--demo`), and the API then reports
-  `"physical": false` and health status `"demo"`. Replayed blocks are detected and dropped.
+  as a **demo** (`ALEAMARIS_CREDIT_FILE_SOURCE=1` / `--demo`, off by default everywhere,
+  Docker included), and the API then reports `"physical": false`, health status `"demo"` and an
+  `X-TRNG-Demo` header on `/trng/bytes`. Replayed sample chunks are detected and dropped.
 - **DRBG:** ChaCha20 (from `cryptography`/OpenSSL). After every call the key is replaced by fresh
   keystream (backtracking resistance), and reseeds go through HMAC-SHA256. Each big request gets
   its own child DRBG and is streamed from a worker thread, so a 10 GB download never blocks other
-  clients.
+  clients. The child re-keys from the parent every 16 MiB, so its output counts toward the
+  parent's reseed interval and parent reseeds reach long streams too.
 
 ## ✨ Features
 
@@ -119,8 +121,10 @@ python src/bin/trng_cli.py --video sample.MP4 --demo --bytes 1024
 ALEAMARIS_USE_CAM=1 ALEAMARIS_API_KEY=changeme uvicorn --app-dir src api.app:app --port 8080
 # demo (video + urandom fallback for the DRBG)
 ./scripts/start.sh -v sample.MP4 --demo --allow-urandom -p 8080
-# docker: API on :50000, web UI on :50001
+# docker: API on :50000, web UI on :50001 (no camera: DRBG only, /trng/bytes -> 503)
 docker compose up --build
+# docker with the video credited as a demo
+ALEAMARIS_CREDIT_FILE_SOURCE=1 docker compose up --build
 ```
 
 ---

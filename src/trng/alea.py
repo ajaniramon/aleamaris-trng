@@ -13,6 +13,8 @@ INT64_MIN = -(1 << 63)
 INT64_MAX = (1 << 63) - 1
 # Above this we split generate() calls so one huge request never holds the lock long.
 _LOCKED_CHUNK = 1 << 20
+# A child stream re-keys from its parent at least this often.
+_CHILD_REFRESH_MAX = 16 << 20
 
 
 def randbelow(random_bytes: Callable[[int], bytes], n: int) -> int:
@@ -143,13 +145,19 @@ class AleaMaris:
         return len(fresh)
 
     # ---- children for streaming ----
-    def fork(self) -> ChaCha20DRBG:
-        """Independent DRBG seeded from this one. Use it for one big stream so
-        the shared lock is touched exactly once per request."""
-        seed = self.random_bytes(32)
+    def fork(self) -> "ChildDRBG":
+        """Per-request DRBG for one big stream: it touches the shared lock only
+        once every few MiB instead of on every chunk."""
         with self._lock:
             self.children_forked += 1
-        return ChaCha20DRBG(seed)
+        return ChildDRBG(self, min(self.reseed_interval_bytes, _CHILD_REFRESH_MAX))
+
+    def _child_rekey(self, produced: int) -> bytes:
+        """Count a child's output toward our reseed interval (reseeding from the
+        source if due) and hand it fresh key material."""
+        with self._lock:
+            self._account(produced)
+            return self._drbg.generate(32)
 
     # ---- integers ----
     def randbelow(self, n: int) -> int:
@@ -172,3 +180,33 @@ class AleaMaris:
                 "reseed_count": self.reseed_count,
                 "children_forked": self.children_forked,
             }
+
+
+class ChildDRBG:
+    """DRBG owned by a single streaming request.
+
+    Every `refresh_bytes` of output it mixes fresh key material from the
+    parent into its state. Its output therefore counts toward the parent's
+    byte-based reseed interval, and parent reseeds (periodic or from the TRNG)
+    reach a long-running stream within `refresh_bytes`.
+    """
+
+    def __init__(self, parent: AleaMaris, refresh_bytes: int):
+        self._parent = parent
+        self._refresh = max(1, refresh_bytes)
+        self._drbg = ChaCha20DRBG(parent._child_rekey(0))
+        self._since = 0
+        self.rekeys = 0
+
+    def generate(self, n: int) -> bytes:
+        parts = []
+        while n > 0:
+            if self._since >= self._refresh:
+                self._drbg.reseed(self._parent._child_rekey(self._since))
+                self._since = 0
+                self.rekeys += 1
+            take = min(n, self._refresh - self._since)
+            parts.append(self._drbg.generate(take))
+            self._since += take
+            n -= take
+        return b"".join(parts)
