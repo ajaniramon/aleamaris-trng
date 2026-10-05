@@ -13,7 +13,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-from trng.generator import EntropyCollector  # noqa: E402
+from trng.generator import BLOCK_BYTES, EntropyCollector  # noqa: E402
 from trng.queue import TrngQueue  # noqa: E402
 from trng.sources import CameraVideoSource, FileVideoSource  # noqa: E402
 from trng.utils import RawSampleWriter  # noqa: E402
@@ -41,7 +41,8 @@ def main() -> int:
         factory = lambda: CameraVideoSource(args.cam)  # noqa: E731
 
     raw = RawSampleWriter(args.dump_raw, args.raw_limit) if args.dump_raw else None
-    pool = TrngQueue(cap_bytes=max(args.bytes, 32))
+    # the collector only admits whole 32-byte blocks: round the pool up to fit them
+    pool = TrngQueue(cap_bytes=max(1, -(-args.bytes // BLOCK_BYTES)) * BLOCK_BYTES)
     col = EntropyCollector(factory, pool, h_claim=args.h_claim, max_samples=args.max_samples,
                            credit_non_physical=args.demo, raw_sink=raw)
     try:

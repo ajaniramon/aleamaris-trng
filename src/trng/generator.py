@@ -228,12 +228,20 @@ class EntropyCollector:
         self._thread.start()
 
     def stop(self, timeout: float = 5.0) -> None:
+        deadline = time.monotonic() + timeout
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout)
             self._thread = None
-        with self._lock:
-            self.close()
+        # A hung driver can keep step() blocked in read() while holding the lock;
+        # never let that block shutdown (the collector thread is a daemon).
+        if self._lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
+            try:
+                self.close()
+            finally:
+                self._lock.release()
+        else:
+            log.warning("entropy source still busy at shutdown; not releasing it")
 
     def _run(self) -> None:
         while not self._stop.is_set():

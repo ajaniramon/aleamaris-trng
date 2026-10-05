@@ -28,7 +28,6 @@ log = get_logger("api")
 SEED_BYTES = 48
 MAX_BIGINT_COUNT = 10_000  # ranges beyond int64 use the scalar (arbitrary precision) path
 NDJSON_BATCH = 65_536
-STALL_SEC = 10.0
 
 
 def default_source_factory(settings: Settings) -> Optional[Callable[[], VideoSource]]:
@@ -245,7 +244,7 @@ def create_app(settings: Optional[Settings] = None,
         stale = st["seconds_since_last_frame"]
         if st["state"] == "failed":
             status = "failed"
-        elif st["state"] == "running" and stale is not None and stale > STALL_SEC:
+        elif st["state"] == "running" and stale is not None and stale > settings.stall_timeout_sec:
             status = "degraded"  # source open but no frame lately (hung driver?)
         elif st["state"] == "running" and st["entropy_credited"]:
             # a recorded video in demo mode works, but its output is not secret

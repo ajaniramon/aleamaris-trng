@@ -28,6 +28,7 @@ class Settings:
     max_samples_per_frame: int = 16384
     bits_per_block: int = 512            # assessed bits behind each 256-bit output block
     max_consecutive_failures: int = 30
+    stall_timeout_sec: float = 10.0      # health "degraded" if no frame for this long
 
     # TRNG pool
     pool_cap_bytes: int = 1 << 20
@@ -61,6 +62,7 @@ class Settings:
             max_samples_per_frame=_env_int("ALEAMARIS_MAX_SAMPLES", 16384),
             bits_per_block=_env_int("ALEAMARIS_BITS_PER_BLOCK", 512),
             max_consecutive_failures=_env_int("ALEAMARIS_MAX_HEALTH_FAILURES", 30),
+            stall_timeout_sec=_env_float("ALEAMARIS_STALL_TIMEOUT", 10.0),
             pool_cap_bytes=_env_int("ALEAMARIS_POOL_CAP", 1 << 20),
             allow_urandom=_env_bool("ALEAMARIS_ALLOW_URANDOM", False),
             boot_timeout_sec=_env_float("ALEAMARIS_BOOT_TIMEOUT", 10.0),

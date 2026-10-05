@@ -165,6 +165,7 @@ curl -s "localhost:8080/rng/ints?min=1&max=6&count=10000000&fmt=ndjson" | head
 | `ALEAMARIS_RESEED_INTERVAL_BYTES` | `67108864` | Also reseed after this much output |
 | `ALEAMARIS_MAX_STREAM_BYTES` | `68719476736` | Max bytes in one response |
 | `ALEAMARIS_MAX_STREAMS` | `8` | Concurrent large streams (429 beyond) |
+| `ALEAMARIS_STALL_TIMEOUT` | `10` | Health turns `degraded` if the source delivers no frame for this long |
 | `ALEAMARIS_POOL_CAP` | `1048576` | TRNG pool size |
 | `ALEAMARIS_CORS_ORIGINS` | `*` | Comma-separated allowed origins |
 

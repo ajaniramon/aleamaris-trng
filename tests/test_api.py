@@ -182,14 +182,37 @@ def test_request_id_header(c):
     assert c.get("/trng/health", headers={"X-Request-ID": "abc"}).headers["x-request-id"] == "abc"
 
 
-def test_health_degraded_when_frames_stall(c):
-    col = c.app.state.collector
-    saved = col.last_frame_at
-    col.last_frame_at = time.monotonic() - 3600
+class HangingCamera(NoiseCamera):
+    """Delivers a few frames, then read() blocks (hung driver)."""
+
+    def __init__(self, release, good_frames=5):
+        super().__init__()
+        self.release_evt = release
+        self.left = good_frames
+
+    def read(self):
+        self.left -= 1
+        if self.left < 0:
+            self.release_evt.wait()
+        return super().read()
+
+
+def test_health_degraded_when_frames_stall():
+    import threading
+    release = threading.Event()
     try:
-        assert c.get("/trng/health").json()["status"] == "degraded"
+        with client(factory=lambda: HangingCamera(release), stall_timeout_sec=0.3,
+                    allow_urandom=True, boot_timeout_sec=1) as tc:
+            deadline = time.time() + 5
+            status = None
+            while time.time() < deadline:
+                status = tc.get("/trng/health").json()["status"]
+                if status == "degraded":
+                    break
+                time.sleep(0.05)
+            assert status == "degraded"
     finally:
-        col.last_frame_at = saved
+        release.set()
 
 
 def test_demo_header_only_for_recordings(c):
