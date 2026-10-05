@@ -1,22 +1,31 @@
+"""Turn video frames into raw noise samples.
+
+The sample is the temporal difference of each pixel between two consecutive
+frames (mod 256), on a sparse grid at native resolution. No resizing/blurring:
+averaging pixels averages away exactly the sensor noise we want to measure.
+"""
+from __future__ import annotations
+
+import math
+
 import cv2
 import numpy as np
 
-def to_gray_small(bgr: np.ndarray, size: int) -> np.ndarray:
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    gray_small = cv2.resize(gray, (size, size), interpolation=cv2.INTER_AREA)
-    return gray_small
 
-def laplacian_edges(gray_small: np.ndarray) -> np.ndarray:
-    lap = cv2.Laplacian(gray_small, ddepth=cv2.CV_16S, ksize=3)
-    edges = np.clip(np.abs(lap) >> 1, 0, 255).astype(np.uint8)
-    return edges
+def to_gray(frame: np.ndarray) -> np.ndarray:
+    if frame.ndim == 2:
+        return frame
+    return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-def make_features(gray_small: np.ndarray,
-                  prev_gray_small: np.ndarray | None,
-                  use_diff: bool) -> bytes:
-    edges = laplacian_edges(gray_small)
-    parts = [gray_small.tobytes(), edges.tobytes()]
-    if use_diff and prev_gray_small is not None:
-        diff = cv2.absdiff(gray_small, prev_gray_small)
-        parts.append(diff.tobytes())
-    return b"".join(parts)
+
+def grid_step(shape: tuple[int, int], max_samples: int) -> int:
+    h, w = shape
+    return max(1, math.ceil(math.sqrt(h * w / max_samples)))
+
+
+def diff_samples(gray: np.ndarray, prev_gray: np.ndarray, max_samples: int) -> np.ndarray:
+    """uint8 samples: (gray - prev_gray) mod 256 on a grid of at most max_samples pixels."""
+    step = grid_step(gray.shape, max_samples)
+    cur = gray[::step, ::step].astype(np.int16)
+    prev = prev_gray[::step, ::step].astype(np.int16)
+    return ((cur - prev) & 0xFF).astype(np.uint8).ravel()[:max_samples]

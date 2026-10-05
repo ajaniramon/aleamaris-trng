@@ -1,37 +1,81 @@
 #!/usr/bin/env python3
-import argparse, sys
-from trng.config import GenConfig
-from trng.sources import FileVideoSource, CameraVideoSource
-from trng.generator import TRNGGenerator
+"""AleaMaris TRNG from the command line.
 
-def main():
-    ap = argparse.ArgumentParser(description="TRNG desde video/cámara (CLI).")
+Examples:
+  python src/bin/trng_cli.py --cam 0 --bytes 4096 --out out.bin
+  python src/bin/trng_cli.py --cam 0 --dump-raw raw.bin --raw-limit 1000000   # for NIST ea_non_iid
+  python src/bin/trng_cli.py --video sample.MP4 --demo --bytes 1024           # pipeline demo, NOT random
+"""
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+
+from trng.generator import EntropyCollector  # noqa: E402
+from trng.queue import TrngQueue  # noqa: E402
+from trng.sources import CameraVideoSource, FileVideoSource  # noqa: E402
+from trng.utils import RawSampleWriter  # noqa: E402
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="TRNG from camera noise (CLI).")
     src = ap.add_mutually_exclusive_group(required=True)
-    src.add_argument("--video", help="Ruta a archivo de vídeo.")
-    src.add_argument("--cam", type=int, help="Índice de cámara (0 por defecto).")
-    ap.add_argument("--bytes", type=int, default=1024, help="Bytes a generar.")
-    ap.add_argument("--resize", type=int, default=64, help="Reducción NxN.")
-    ap.add_argument("--stride", type=int, default=1, help="Procesa 1 de cada N frames.")
-    ap.add_argument("--diff", action="store_true", help="Añade diferencia temporal.")
-    ap.add_argument("--debug", action="store_true", help="Dumpea artefactos de los primeros frames.")
-    ap.add_argument("--debug-frames", type=int, default=4, help="Cuántos frames dumpear en debug.")
-    ap.add_argument("--out", help="Fichero de salida binario. Si no, imprime hex.")
+    src.add_argument("--cam", type=int, help="Camera index (live sensor noise).")
+    src.add_argument("--video", help="Video file. Deterministic: only useful with --demo or --dump-raw.")
+    ap.add_argument("--demo", action="store_true",
+                    help="Credit entropy to a video file anyway (demo only: output is NOT secret).")
+    ap.add_argument("--bytes", type=int, default=1024, help="Conditioned bytes to produce.")
+    ap.add_argument("--h-claim", type=float, default=1.0, help="Max min-entropy credited per sample (bits).")
+    ap.add_argument("--max-samples", type=int, default=16384, help="Raw samples taken per frame.")
+    ap.add_argument("--max-frames", type=int, default=100_000, help="Give up after this many frames.")
+    ap.add_argument("--dump-raw", help="Write raw 8-bit noise samples here (for SP 800-90B tools).")
+    ap.add_argument("--raw-limit", type=int, default=1_000_000, help="Max raw samples to dump.")
+    ap.add_argument("--out", help="Binary output file. Default: print hex.")
     args = ap.parse_args()
 
-    cfg = GenConfig(bytes_total=args.bytes, resize=args.resize, stride=args.stride,
-                    use_diff=args.diff, debug=args.debug, debug_frames=args.debug_frames)
+    if args.video:
+        factory = lambda: FileVideoSource(args.video)  # noqa: E731
+    else:
+        factory = lambda: CameraVideoSource(args.cam)  # noqa: E731
 
-    source = FileVideoSource(args.video) if args.video else CameraVideoSource(args.cam if args.cam is not None else 0)
-    gen = TRNGGenerator(source, cfg)
-    data = gen.produce()
+    raw = RawSampleWriter(args.dump_raw, args.raw_limit) if args.dump_raw else None
+    pool = TrngQueue(cap_bytes=max(args.bytes, 32))
+    col = EntropyCollector(factory, pool, h_claim=args.h_claim, max_samples=args.max_samples,
+                           credit_non_physical=args.demo, raw_sink=raw)
+    try:
+        for _ in range(args.max_frames):
+            done_bytes = pool.available() >= args.bytes
+            done_raw = raw is None or raw.written >= args.raw_limit
+            if done_bytes and done_raw:
+                break
+            if col.step() < 0:
+                break
+    finally:
+        col.stop()
+        if raw:
+            raw.close()
 
+    st = col.status()
+    print(json.dumps(st, indent=2), file=sys.stderr)
+    if raw:
+        print(f"[raw] {raw.written} samples -> {args.dump_raw}", file=sys.stderr)
+    if not st["entropy_credited"]:
+        print("[!] source not credited (recorded video without --demo): no output produced", file=sys.stderr)
+
+    data = pool.poll(args.bytes)
     if args.out:
         with open(args.out, "wb") as f:
             f.write(data)
-        print(f"[OK] {len(data)} bytes -> {args.out}")
-    else:
+        print(f"[OK] {len(data)} bytes -> {args.out}", file=sys.stderr)
+    elif data:
         print(data.hex())
-        print(f"[OK] {len(data)} bytes (hex arriba)")
+    if len(data) < args.bytes:
+        print(f"[!] only {len(data)}/{args.bytes} bytes produced (state: {st['state']})", file=sys.stderr)
+        return 1
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

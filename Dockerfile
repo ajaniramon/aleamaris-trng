@@ -1,31 +1,25 @@
 # AleaMaris TRNG — Dockerfile
-# Arranca FastAPI con uvicorn usando sample.MP4 como fuente de vídeo
+# FastAPI + uvicorn. Containers usually have no camera, so by default this runs
+# the *demo* pipeline on sample.MP4 (a recording: its output is NOT secret) and
+# lets the DRBG fall back to os.urandom once the video is used up.
+# For a real TRNG, pass a camera through (--device /dev/video0) and set
+# ALEAMARIS_USE_CAM=1, ALEAMARIS_CREDIT_FILE_SOURCE=0.
 
 FROM python:3.11-slim AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# Dependencias mínimas para opencv-python (lectura de vídeo)
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-       libgl1 \
-       libglib2.0-0 \
-    && rm -rf /var/lib/apt/lists/*
-
 WORKDIR /app
 
-# Instalar deps
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copiar código y vídeo de muestra
 COPY src ./src
 COPY sample.MP4 /app/sample.MP4
 
-# Variables por defecto: usa sample.MP4 y sin API key
 ENV ALEAMARIS_VIDEO=/app/sample.MP4 \
-    ALEAMARIS_API_KEY="" \
+    ALEAMARIS_CREDIT_FILE_SOURCE=1 \
     ALEAMARIS_ALLOW_URANDOM=1
 
 EXPOSE 8080

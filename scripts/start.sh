@@ -13,15 +13,16 @@
 #   -v, --video <path>          Ruta vídeo (export ALEAMARIS_VIDEO)
 #   -c, --cam <index>           Índice de cámara (export ALEAMARIS_USE_CAM=1 y ALEAMARIS_CAM)
 #   -k, --api-key <key>         X-API-Key para proteger ingest/reseed (export ALEAMARIS_API_KEY)
-#   --allow-urandom             Permite /dev/urandom en boot (export ALEAMARIS_ALLOW_URANDOM=1)
+#   --allow-urandom             El DRBG puede usar os.urandom si no hay entropía TRNG (export ALEAMARIS_ALLOW_URANDOM=1)
+#   --demo                      Acredita entropía a un vídeo grabado (solo demo; export ALEAMARIS_CREDIT_FILE_SOURCE=1)
 #   --reseed-period <sec>       Periodo de reseed DRBG (export ALEAMARIS_RESEED_PERIOD)
 #   --reseed-bytes <n>          Bytes por reseed DRBG (export ALEAMARIS_RESEED_BYTES)
-#   --boot-bytes <n>            Bytes de boot del DRBG (export ALEAMARIS_BOOT_BYTES)
+#   --h-claim <bits>            Min-entropía máxima acreditada por muestra (export ALEAMARIS_H_CLAIM)
 #   --log-level <level>         Log level uvicorn (info, warning, error, debug)
 #   --reload                    Habilita reload (dev)
 #
 # Ejemplos:
-#   ./scripts/start.sh -v sample.mp4 --reload
+#   ./scripts/start.sh -v sample.MP4 --demo --allow-urandom --reload
 #   ./scripts/start.sh -c 0 -k secret123 --reseed-period 60 --reseed-bytes 64
 set -euo pipefail
 
@@ -34,13 +35,14 @@ API_KEY=""
 ALLOW_URANDOM=0
 RESEED_PERIOD=""
 RESEED_BYTES=""
-BOOT_BYTES=""
+H_CLAIM=""
+DEMO=0
 LOG_LEVEL="info"
 RELOAD=0
 
 # Pick a free random port in [10240, 65535]
 choose_port() {
-  python - "$@" <<'PY'
+  python3 - "$@" <<'PY'
 import random, socket
 for _ in range(200):
     port = random.randint(10240, 65535)
@@ -66,7 +68,8 @@ while [[ $# -gt 0 ]]; do
     --allow-urandom) ALLOW_URANDOM=1; shift 1;;
     --reseed-period) RESEED_PERIOD="$2"; shift 2;;
     --reseed-bytes) RESEED_BYTES="$2"; shift 2;;
-    --boot-bytes) BOOT_BYTES="$2"; shift 2;;
+    --h-claim) H_CLAIM="$2"; shift 2;;
+    --demo) DEMO=1; shift 1;;
     --log-level) LOG_LEVEL="$2"; shift 2;;
     --reload) RELOAD=1; shift 1;;
     -h|--help)
@@ -95,7 +98,8 @@ fi
 if [[ "$ALLOW_URANDOM" == "1" ]]; then export ALEAMARIS_ALLOW_URANDOM=1; fi
 if [[ -n "$RESEED_PERIOD" ]]; then export ALEAMARIS_RESEED_PERIOD="$RESEED_PERIOD"; fi
 if [[ -n "$RESEED_BYTES" ]]; then export ALEAMARIS_RESEED_BYTES="$RESEED_BYTES"; fi
-if [[ -n "$BOOT_BYTES" ]]; then export ALEAMARIS_BOOT_BYTES="$BOOT_BYTES"; fi
+if [[ -n "$H_CLAIM" ]]; then export ALEAMARIS_H_CLAIM="$H_CLAIM"; fi
+if [[ "$DEMO" == "1" ]]; then export ALEAMARIS_CREDIT_FILE_SOURCE=1; fi
 
 APP="api.app:app"
 APP_DIR="src"

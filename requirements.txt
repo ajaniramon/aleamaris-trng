@@ -1,5 +1,5 @@
 fastapi
 uvicorn[standard]
-opencv-python
+opencv-python-headless
 numpy
-pillow
+cryptography
