@@ -221,9 +221,14 @@ class EntropyCollector:
 
     # ---------- background thread ----------
     def start(self) -> None:
-        if self._thread is not None or self.source_factory is None:
+        if self.source_factory is None:
             return
         self._stop.clear()
+        if self._thread is not None and self._thread.is_alive():
+            # a previous worker is still around (e.g. stuck in a hung read when
+            # stop() gave up): clearing the stop flag lets it carry on, and we
+            # never run two workers against the same source
+            return
         self._thread = threading.Thread(target=self._run, name="entropy-collector", daemon=True)
         self._thread.start()
 
@@ -232,7 +237,9 @@ class EntropyCollector:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout)
-            self._thread = None
+            if not self._thread.is_alive():
+                self._thread = None
+            # else: keep the reference so start() cannot spawn a second worker
         # A hung driver can keep step() blocked in read() while holding the lock;
         # never let that block shutdown (the collector thread is a daemon).
         if self._lock.acquire(timeout=max(0.0, deadline - time.monotonic())):

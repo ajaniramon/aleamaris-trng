@@ -122,3 +122,29 @@ def test_pool_admits_whole_blocks_and_credits_only_those():
     assert st["blocks"] == 3
     assert 3 * 512 <= st["bits_credited"] < 4 * 512
     assert st["blocks_dropped_pool_full"] > 0
+
+
+def test_restart_after_hung_stop_never_runs_two_workers():
+    import threading
+
+    release = threading.Event()
+    reading = threading.Event()
+
+    class Hang(NoiseCamera):
+        def read(self):
+            reading.set()
+            release.wait()
+            return super().read()
+
+    c = EntropyCollector(lambda: Hang(), TrngQueue())
+    c.start()
+    assert reading.wait(5)
+    worker = c._thread
+    c.stop(timeout=0.2)           # read() still blocked: stop gives up
+    assert c._thread is worker and worker.is_alive()
+    c.start()                     # must reuse, not spawn a second worker
+    assert c._thread is worker
+    assert sum(t.name == "entropy-collector" and t.is_alive() for t in threading.enumerate()) == 1
+    release.set()
+    c.stop(timeout=5)
+    assert c._thread is None and not worker.is_alive()
