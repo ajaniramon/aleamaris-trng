@@ -1,221 +1,303 @@
-from typing import Optional
-from .config import GenConfig
-from .sources import VideoSource, FileVideoSource
-from .features import to_gray_small, make_features
-from .utils import dump_debug
-import struct, secrets, hmac, hashlib
-import cv2
+"""Entropy collector: frames -> raw noise samples -> health tests -> SHA-256 -> pool.
+
+Entropy accounting per frame:
+  h = min(MCV estimate, h_claim) bits per sample
+  each 32-byte output block consumes ceil(bits_per_block / h) samples
+With the default bits_per_block = 512 every 256-bit block is backed by at
+least twice its size in assessed min-entropy.
+
+Samples are health-tested in 512-sample tiles (see health.py); tiles that
+fail RCT/APT are discarded and only passing tiles are estimated and used.
+A frame with no passing tile is a failure. After `max_consecutive_failures`
+failing frames in a row the source is reported as "failed" (it keeps being
+tested and recovers on its own if the noise comes back).
+"""
+from __future__ import annotations
+
+import hashlib
+import math
+import threading
+import time
+from collections import OrderedDict
+from typing import Callable, Optional
+
 import numpy as np
+
+from .conditioners import sha256_condition
+from .features import diff_samples, to_gray
+from .health import HealthTester
 from .logging import get_logger
+from .queue import TrngQueue
+from .sources import VideoSource
 
-log = get_logger("trng.generator")
+log = get_logger("trng.collector")
 
-def hkdf_mix(key: bytes, data: bytes, out_len: int = 32) -> bytes:
-    """
-    HKDF-like mixer (HMAC-SHA256 extract+expand). Suficiente para rotar la key interna.
-    """
-    if not key:
-        key = b"\x00" * 32
-    prk = hmac.new(key, data, hashlib.sha256).digest()
-    t = b""; out = b""; counter = 1
-    while len(out) < out_len:
-        t = hmac.new(prk, t + b"" + bytes([counter]), hashlib.sha256).digest()
-        out += t; counter += 1
-    return out[:out_len]
+BLOCK_BYTES = 32
 
-def blake2b_keyed(key: bytes, *parts: bytes, digest_size: int = 32) -> bytes:
-    h = hashlib.blake2b(key=key, digest_size=digest_size)
-    for p in parts:
-        if not p:
-            continue
-        h.update(p)
-    return h.digest()
 
-class TRNGGenerator:
-    def __init__(self, source: VideoSource, cfg: GenConfig):
-        self.source = source
-        self.cfg = cfg
-        # Salt único por sesión/boot
-        self.epoch_salt = secrets.token_bytes(32)
-        # Contadores anti-patrón
-        self.pass_counter = 0         # sube al terminar una pasada/permuta o al rebobinar
-        self.global_counter = 0       # sube cada frame procesado
-        # Keyed whitening interna que rotamos periódicamente
-        self.key = secrets.token_bytes(32)
-        self.key_frames_since_reseed = 0
-        self.key_reseed_interval_frames = 512  # ajustable si quieres
-        # Detector de repetición sencillo (ventana LRU)
-        self._recent = set()
-        self._recent_order = []  # lista para poder purgar en FIFO
-        self._recent_cap = 4096
+class EntropyCollector:
+    def __init__(self,
+                 source_factory: Optional[Callable[[], VideoSource]],
+                 pool: TrngQueue,
+                 *,
+                 h_claim: float = 1.0,
+                 max_samples: int = 16384,
+                 bits_per_block: int = 512,
+                 credit_non_physical: bool = False,
+                 max_consecutive_failures: int = 30,
+                 reopen_delay_sec: float = 5.0,
+                 max_read_failures: int = 30,
+                 raw_sink: Optional[Callable[[bytes], None]] = None):
+        self.source_factory = source_factory
+        self.pool = pool
+        self.tester = HealthTester(h_claim)
+        self.max_samples = max_samples
+        self.bits_per_block = bits_per_block
+        self.credit_non_physical = credit_non_physical
+        self.max_consecutive_failures = max_consecutive_failures
+        self.reopen_delay_sec = reopen_delay_sec
+        self.max_read_failures = max_read_failures
+        self.raw_sink = raw_sink
 
-    # ---------- utilidades de permutación (seekable file sources) ----------
+        self.source: Optional[VideoSource] = None
+        self.source_name: Optional[str] = None
+        self.source_physical: Optional[bool] = None
+        self._prev: Optional[np.ndarray] = None
+        self._block_counter = 0
+        # fingerprints of raw sample chunks (no counter), to catch replayed input
+        self._recent_blocks: OrderedDict[bytes, None] = OrderedDict()
+        self._recent_cap = 65536
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._lock = threading.Lock()
 
-    def _is_seekable_file(self) -> bool:
-        return isinstance(self.source, FileVideoSource) and hasattr(self.source, "cap")
+        # status
+        self.state = "idle" if source_factory else "no-source"
+        self.frames = 0
+        self.frames_failed = 0
+        self.tiles = 0
+        self.tiles_passed = 0
+        self.consecutive_failures = 0
+        self.consecutive_read_failures = 0
+        self.last_frame_at: Optional[float] = None
+        self.blocks = 0
+        self.blocks_dropped_pool_full = 0
+        self.duplicate_blocks = 0
+        self.bits_credited = 0.0
+        self.last_h_estimate: Optional[float] = None
+        self.last_error: Optional[str] = None
 
-    def _get_frame_count(self) -> int:
+    # ---------- source management ----------
+    def open(self) -> bool:
+        if self.source is not None:
+            return True
+        if self.source_factory is None:
+            self.state = "no-source"
+            return False
         try:
-            return int(self.source.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        except Exception:
-            return -1
+            self.source = self.source_factory()
+        except Exception as e:  # camera unplugged, missing file...
+            self.state = "unavailable"
+            self.last_error = str(e)
+            log.warning("entropy source unavailable", extra={"error": str(e)})
+            return False
+        self._prev = None
+        self.source_name = self.source.name
+        self.source_physical = bool(self.source.physical)
+        self.state = "running"
+        log.info("entropy source opened", extra={"source": self.source.name, "physical": self.source.physical})
+        return True
 
-    def _permute_indices(self, n: int) -> list[int]:
-        # Fisher-Yates usando secrets.randbelow (criptográficamente fuerte)
-        idx = list(range(0, n, self.cfg.stride))
-        for i in range(len(idx) - 1, 0, -1):
-            r = secrets.randbelow(i + 1)
-            idx[i], idx[r] = idx[r], idx[i]
-        return idx
-
-    def _read_frame_at(self, i: int) -> Optional[np.ndarray]:
-        # Seek y read en fuentes de fichero
-        try:
-            self.source.cap.set(cv2.CAP_PROP_POS_FRAMES, i)
-            ok, frame = self.source.cap.read()
-            if not ok:
-                return None
-            return frame
-        except Exception:
-            return None
-
-    # ---------- rotación de clave y detector ----------
-
-    def _rotate_key(self, material: bytes):
-        salt = secrets.token_bytes(32)
-        self.key = hkdf_mix(self.key, material + salt + struct.pack(">II", self.pass_counter, self.global_counter), 32)
-        self.key_frames_since_reseed = 0
-
-    def _recent_add_and_check(self, digest: bytes) -> bool:
-        """Devuelve True si el digest ya estaba (repetición)."""
-        rep = digest in self._recent
-        if not rep:
-            self._recent.add(digest)
-            self._recent_order.append(digest)
-            if len(self._recent_order) > self._recent_cap:
-                # Purga FIFO
-                old = self._recent_order.pop(0)
-                if old in self._recent:
-                    self._recent.remove(old)
-        return rep
-
-    # ---------- pipeline principal ----------
-
-    def _process_frame_bytes(self, frame: np.ndarray, prev_small: Optional[np.ndarray], frame_idx: int) -> tuple[bytes, np.ndarray]:
-        gray_small = to_gray_small(frame, self.cfg.resize)
-        feats = make_features(gray_small, prev_small, self.cfg.use_diff)
-        # Mezcla anti-patrón: epoch_salt + contadores + features + frame_idx
-        header = (
-            self.epoch_salt +
-            struct.pack(">III", self.pass_counter, self.global_counter, frame_idx)
-        )
-        # Keyed whitening con blake2b (key interna que vamos rotando)
-        dgst = blake2b_keyed(self.key, header, feats, digest_size=32)  # 32 bytes por frame
-
-        # Detector de repetición (si algo raro pasa)
-        _ = self._recent_add_and_check(dgst)
-        # Reseed de la key periódicamente con material fresco
-        self.key_frames_since_reseed += 1
-        if self.key_frames_since_reseed >= self.key_reseed_interval_frames:
-            self._rotate_key(dgst)
-
-        return dgst, gray_small
-
-    def produce(self) -> bytes:
-        want = max(1, self.cfg.bytes_total)
-        produced = bytearray()
-
-        # Ruta 1: fichero seekable con permutación de frames
-        if self._is_seekable_file():
-            prev_small = None
-            debug_left = self.cfg.debug_frames if self.cfg.debug else 0
+    def close(self) -> None:
+        if self.source is not None:
             try:
-                total = self._get_frame_count()
-                if total <= 0:
-                    # Fallback a ruta 2 si no podemos contar frames
-                    raise RuntimeError("non-positive frame count")
-                # Genera una permutación inicial
-                indices = self._permute_indices(total)
-                p = 0  # puntero dentro de la permutación
-                frame_idx = 0
-                while len(produced) < want:
-                    if p >= len(indices):
-                        # Fin de la permutación: nueva pasada
-                        self.pass_counter += 1
-                        self.epoch_salt = secrets.token_bytes(32)  # nueva época por pasada
-                        indices = self._permute_indices(total)
-                        p = 0
-                        prev_small = None  # resetea ref para diffs
-
-                    i = indices[p]; p += 1
-                    frame = self._read_frame_at(i)
-                    if frame is None:
-                        continue
-
-                    dgst, gray_small = self._process_frame_bytes(frame, prev_small, frame_idx)
-
-                    # acumula
-                    need = want - len(produced)
-                    if need >= len(dgst):
-                        produced.extend(dgst)
-                    else:
-                        produced.extend(dgst[:need])
-
-                    # debug opcional solo primeros N frames
-                    if debug_left > 0:
-                        dump_debug(frame_idx, frame, gray_small, b"", dgst,
-                                   self.cfg.resize, self.cfg.stride, self.cfg.use_diff, prev_small)
-                        debug_left -= 1
-
-                    prev_small = gray_small
-                    frame_idx += 1
-                    self.global_counter += 1
-            finally:
                 self.source.release()
+            finally:
+                self.source = None
 
-            log.info("video processed seekable", extra={"generated_bytes": len(produced), "pass_counter": self.pass_counter, "global_counter": self.global_counter})
-            return bytes(produced)
+    @property
+    def credited(self) -> bool:
+        return self.source_physical is not None and (self.source_physical or self.credit_non_physical)
 
-        # Ruta 2: fuente no seekable (cámara o lectura lineal)
-        prev_small = None
-        frame_idx = 0
-        debug_left = self.cfg.debug_frames if self.cfg.debug else 0
-        try:
-            while len(produced) < want:
-                frame = self.source.read()
-                if frame is None:
-                    # rebobina si es fichero (si tiene rewind); en cámara no hace nada
-                    log.debug("rewind or loop non-seekable source")
-                    self.source.rewind()
-                    prev_small = None
-                    self.pass_counter += 1
-                    # refresca epoch salt por pasada
-                    self.epoch_salt = secrets.token_bytes(32)
-                    continue
-                if (frame_idx % self.cfg.stride) != 0:
-                    frame_idx += 1
-                    continue
+    # ---------- core ----------
+    def process_samples(self, samples: np.ndarray, *, credit: bool = True) -> list[tuple[bytes, float]]:
+        """Health-test one batch of samples and return (32-byte block, credited bits)
+        pairs. Credit is only booked by admit(), once a block is in the pool."""
+        if self.raw_sink is not None:
+            self.raw_sink(samples.tobytes())
+        res = self.tester.check(samples)
+        self.frames += 1
+        self.tiles += res.tiles
+        self.tiles_passed += res.tiles_passed
+        self.last_h_estimate = res.h_estimate
+        if not res.ok:
+            self.frames_failed += 1
+            self.consecutive_failures += 1
+            if self.consecutive_failures >= self.max_consecutive_failures and self.state != "failed":
+                self.state = "failed"
+                log.error("entropy source failed health tests", extra={
+                    "max_run": res.max_run, "rct_cutoff": self.tester.rct_c,
+                    "apt_count": res.apt_count, "apt_cutoff": self.tester.apt_c})
+            return []
+        self.consecutive_failures = 0
+        if self.state == "failed":
+            self.state = "running"
+            log.info("entropy source recovered")
+        if not credit:
+            return []
+        h = min(res.h_estimate, self.tester.h_claim)
+        if h <= 0:
+            return []
+        good = res.good
+        per_block = math.ceil(self.bits_per_block / h)
+        out = []
+        for i in range(good.size // per_block):
+            chunk = good[i * per_block:(i + 1) * per_block].tobytes()
+            if self._seen(chunk):
+                # cannot happen with real noise; a replayed source would trigger it
+                self.duplicate_blocks += 1
+                continue
+            out.append((sha256_condition(chunk, self._block_counter), per_block * h))
+            self._block_counter += 1
+        return out
 
-                dgst, gray_small = self._process_frame_bytes(frame, prev_small, frame_idx)
+    def admit(self, blocks: list[tuple[bytes, float]]) -> int:
+        """Offer whole blocks to the pool; credit only those actually admitted."""
+        room = self.pool.free() // BLOCK_BYTES
+        fit = blocks[:room]
+        self.blocks_dropped_pool_full += len(blocks) - len(fit)
+        if not fit:
+            return 0
+        accepted = self.pool.offer(b"".join(b for b, _ in fit), align=BLOCK_BYTES)
+        n = accepted // BLOCK_BYTES
+        self.blocks += n
+        self.bits_credited += sum(bits for _, bits in fit[:n])
+        return accepted
 
-                # acumula
-                need = want - len(produced)
-                if need >= len(dgst):
-                    produced.extend(dgst)
-                else:
-                    produced.extend(dgst[:need])
+    def _seen(self, chunk: bytes) -> bool:
+        # fingerprint the raw samples only: the conditioning counter must not
+        # make a replayed chunk look new
+        fp = hashlib.sha256(chunk).digest()[:16]
+        if fp in self._recent_blocks:
+            return True
+        self._recent_blocks[fp] = None
+        if len(self._recent_blocks) > self._recent_cap:
+            self._recent_blocks.popitem(last=False)
+        return False
 
-                # debug opcional solo primeros N frames
-                if debug_left > 0:
-                    dump_debug(frame_idx, frame, gray_small, b"", dgst,
-                               self.cfg.resize, self.cfg.stride, self.cfg.use_diff, prev_small)
-                    debug_left -= 1
+    def step(self) -> int:
+        """Read and process one frame. Returns conditioned bytes produced, or -1
+        if the source is gone (exhausted or could not be opened)."""
+        with self._lock:
+            if not self.open():
+                return -1
+            frame = self.source.read()
+            if frame is None:
+                if self.source.finite:
+                    self.state = "exhausted"
+                    log.info("entropy source exhausted", extra={"source": self.source.name})
+                    self.close()
+                    return -1
+                self.consecutive_read_failures += 1
+                if self.consecutive_read_failures >= self.max_read_failures:
+                    # live camera stopped delivering: report it and reopen later
+                    self.state = "unavailable"
+                    self.last_error = "camera returned no frames"
+                    log.warning("entropy source stopped delivering frames; reopening",
+                                extra={"source": self.source.name})
+                    self.close()
+                    self.consecutive_read_failures = 0
+                    return -1
+                return 0
+            self.consecutive_read_failures = 0
+            self.last_frame_at = time.monotonic()
+            gray = to_gray(frame)
+            prev, self._prev = self._prev, gray
+            if prev is None or prev.shape != gray.shape:
+                return 0
+            samples = diff_samples(gray, prev, self.max_samples)
+            blocks = self.process_samples(samples, credit=self.credited)
+            return self.admit(blocks)
 
-                prev_small = gray_small
-                frame_idx += 1
-                self.global_counter += 1
-        finally:
-            self.source.release()
+    # ---------- background thread ----------
+    def start(self) -> None:
+        if self.source_factory is None:
+            return
+        self._stop.clear()
+        if self._thread is not None and self._thread.is_alive():
+            # a previous worker is still around (e.g. stuck in a hung read when
+            # stop() gave up): clearing the stop flag lets it carry on, and we
+            # never run two workers against the same source
+            return
+        self._thread = threading.Thread(target=self._run, name="entropy-collector", daemon=True)
+        self._thread.start()
 
-        log.info("video processed linear", extra={"generated_bytes": len(produced), "pass_counter": self.pass_counter, "global_counter": self.global_counter})
-        return bytes(produced)
+    def stop(self, timeout: float = 5.0) -> None:
+        deadline = time.monotonic() + timeout
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout)
+            if not self._thread.is_alive():
+                self._thread = None
+            # else: keep the reference so start() cannot spawn a second worker
+        # A hung driver can keep step() blocked in read() while holding the lock;
+        # never let that block shutdown (the collector thread is a daemon).
+        if self._lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
+            try:
+                self.close()
+            finally:
+                self._lock.release()
+        else:
+            log.warning("entropy source still busy at shutdown; not releasing it")
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            if self.pool.free() < BLOCK_BYTES:
+                # pool full: drop the reference frame so the next diff is between
+                # two fresh consecutive frames, then wait for consumers
+                self._prev = None
+                self._stop.wait(0.05)
+                continue
+            try:
+                produced = self.step()
+            except Exception as e:
+                self.last_error = str(e)
+                log.error("collector error", exc_info=True)
+                with self._lock:
+                    self.close()
+                produced = -1
+            if produced < 0:
+                if self.state == "exhausted":
+                    return
+                self._stop.wait(self.reopen_delay_sec)
+
+    def status(self) -> dict:
+        return {
+            "state": self.state,
+            "source": self.source_name,
+            "physical": self.source_physical,
+            "entropy_credited": self.credited,
+            "h_claim_bits_per_sample": self.tester.h_claim,
+            "last_min_entropy_estimate": self.last_h_estimate,
+            "rct_cutoff": self.tester.rct_c,
+            "apt_cutoff": self.tester.apt_c,
+            "frames": self.frames,
+            "frames_failed": self.frames_failed,
+            "tile_pass_rate": round(self.tiles_passed / self.tiles, 4) if self.tiles else None,
+            "seconds_since_last_frame": (round(time.monotonic() - self.last_frame_at, 3)
+                                         if self.last_frame_at is not None else None),
+            "blocks": self.blocks,
+            "blocks_dropped_pool_full": self.blocks_dropped_pool_full,
+            "duplicate_blocks": self.duplicate_blocks,
+            "bits_credited": round(self.bits_credited),
+            "last_error": self.last_error,
+        }
+
+    def wait_for(self, n: int, timeout: float) -> bool:
+        """Block until the pool holds n bytes, the source gives up, or timeout."""
+        deadline = time.monotonic() + timeout
+        while self.pool.available() < n:
+            if time.monotonic() >= deadline or self.state in ("exhausted", "no-source"):
+                return False
+            time.sleep(0.05)
+        return True

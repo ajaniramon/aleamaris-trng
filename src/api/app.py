@@ -1,374 +1,389 @@
 # api/app.py
 from __future__ import annotations
-import os, asyncio, struct, concurrent.futures, functools
-from fastapi import FastAPI, Request, Response, Header, Query
-from fastapi.responses import StreamingResponse
-from starlette.middleware import Middleware
 
-from trng.queue import TrngQueue
-from trng.config import GenConfig
-from trng.sources import FileVideoSource, CameraVideoSource
-from trng.generator import TRNGGenerator
-from trng.alea import AleaMaris
+import asyncio
+import hmac
+import os
+import threading
+import uuid
+from contextlib import asynccontextmanager
+from typing import Callable, Iterator, Optional
+
+import numpy as np
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
+from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.middleware.cors import CORSMiddleware
-import logging, uuid
-from trng.logging import setup_logging, get_logger, request_id_ctx
 
+from trng.alea import INT64_MAX, INT64_MIN, AleaMaris, ChildDRBG, randbelow, randints
+from trng.config import Settings
+from trng.feeders import ReseedFeeder
+from trng.generator import EntropyCollector
+from trng.logging import get_logger, request_id_ctx, setup_logging
+from trng.queue import TrngQueue
+from trng.sources import CameraVideoSource, FileVideoSource, VideoSource
 
-middleware = [
-    Middleware(
-        CORSMiddleware,
-        allow_origins=[
-            "*"
-        ],
-        allow_origin_regex=r".*",   # acepta lo que no esté listado (evita sustos)
-        allow_credentials=False,    # si lo pones True, no puedes usar '*'
-        allow_methods=["*"],
-        allow_headers=["*"],
-        expose_headers=["X-Count", "X-Available-After"],
-    )
-]
-
-app = FastAPI(title="AleaMaris TRNG API", middleware=middleware)
-_log_root = setup_logging()
+setup_logging()
 log = get_logger("api")
 
-RAW_CAP               = int(os.environ.get("ALEAMARIS_RAW_CAP", "100000000"))
-BOOT_BYTES            = int(os.environ.get("ALEAMARIS_BOOT_BYTES", "4096"))
-ALLOW_URANDOM_BOOT    = os.environ.get("ALEAMARIS_ALLOW_URANDOM", "0").lower() in ("1","true","yes")
-VIDEO_PATH            = os.environ.get("ALEAMARIS_VIDEO", "sample2.mp4")
-CAM_INDEX             = int(os.environ.get("ALEAMARIS_CAM", "0"))
-FILL_LOW_WM           = int(os.environ.get("ALEAMARIS_RAW_LOW_WM",  "2000"))     # low watermark
-FILL_HIGH_WM          = int(os.environ.get("ALEAMARIS_RAW_HIGH_WM", "5000"))    # high watermark
-FILL_INTERVAL_MS      = int(os.environ.get("ALEAMARIS_FILL_INTERVAL_MS", "200"))  # cada 200ms check
-FILL_CHUNK_BYTES      = int(os.environ.get("ALEAMARIS_FILL_CHUNK", "500"))      # tamaño de aportes
-RESEED_PERIOD_SEC     = int(os.environ.get("ALEAMARIS_RESEED_PERIOD", "120"))      # reseed cada minuto
-RESEED_BYTES          = int(os.environ.get("ALEAMARIS_RESEED_BYTES", "64"))       # bytes por reseed
-RESEED_INTERVAL_BYTES = int(os.environ.get("ALEAMARIS_RESEED_INTERVAL_BYTES", "1000000"))  # umbral de bytes antes de reseed
-API_KEY               = os.environ.get("ALEAMARIS_API_KEY")                       # opcional
-BUF_CHUNK_BYTES       = int(os.environ.get("ALEAMARIS_BUF_CHUNK_BYTES", "262144"))   # 256 KiB por defecto para no bloquear la 1ª req
-WARM_AT_START_BYTES   = int(os.environ.get("ALEAMARIS_WARM_AT_START_BYTES", "262144"))  # calentar algo al arrancar
-WARM_PERIOD_SEC       = int(os.environ.get("ALEAMARIS_WARM_PERIOD_SEC", "30"))   # cada cuánto re-calentar
-WARM_TARGET_BYTES     = int(os.environ.get("ALEAMARIS_WARM_TARGET_BYTES", "4194304"))   # objetivo de bytes en buffer
-WARM_CHUNK_BYTES      = int(os.environ.get("ALEAMARIS_WARM_CHUNK_BYTES", "131072"))   # 128 KiB por iteración de warm
+SEED_BYTES = 48
+MAX_BIGINT_COUNT = 10_000  # ranges beyond int64 use the scalar (arbitrary precision) path
+NDJSON_BATCH = 65_536
 
-# Pipeline de features para “moler” frames a bytes (igual que tu CLI)
-GEN_CFG = GenConfig(bytes_total=FILL_CHUNK_BYTES, resize=64, stride=1, use_diff=True, debug=False)
 
-# -------------------- Cola RAW y DRBG --------------------
-q = TrngQueue(cap_bytes=RAW_CAP)
+def default_source_factory(settings: Settings) -> Optional[Callable[[], VideoSource]]:
+    if settings.use_cam:
+        return lambda: CameraVideoSource(settings.cam_index)
+    if settings.video_path:
+        return lambda: FileVideoSource(settings.video_path)
+    return None
 
-def _try_bytes_from_video_or_cam(n: int) -> bytes:
-    """Intenta sacar n bytes desde VIDEO y/o CAM. Rebobina si es fichero."""
-    if VIDEO_PATH:
-        log.info("video source attempt", extra={"path": VIDEO_PATH, "bytes": n})
+
+class _StreamSlots:
+    """Caps concurrent big streams so a handful of clients cannot pin every CPU."""
+
+    def __init__(self, n: int):
+        self._sem = threading.BoundedSemaphore(n)
+
+    def acquire(self) -> None:
+        if not self._sem.acquire(blocking=False):
+            raise HTTPException(status_code=429, detail="too many concurrent streams, retry later")
+
+    def guard(self, it: Iterator[bytes]) -> "_Guarded":
+        return _Guarded(it, self._sem.release)
+
+
+class _Guarded:
+    """Iterator that releases its stream slot exactly once: when exhausted, on
+    error, or when dropped unstarted (e.g. the client disconnected early)."""
+
+    def __init__(self, it: Iterator[bytes], release: Callable[[], None]):
+        self._it = iter(it)
+        self._release = release
+        self._done = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> bytes:
         try:
-            src = FileVideoSource(VIDEO_PATH)
-            gen = TRNGGenerator(src, GEN_CFG)
-            GEN_CFG.bytes_total = n
-            return gen.produce()
-        except Exception:
-            log.warning("video source failed; will try camera if enabled", extra={"path": VIDEO_PATH})
-    # Si no hay vídeo o falló, intenta cámara si el env lo dice
-    if os.environ.get("ALEAMARIS_USE_CAM", "0").lower() in ("1","true","yes"):
-        try:
-            src = CameraVideoSource(CAM_INDEX)
-            gen = TRNGGenerator(src, GEN_CFG)
-            GEN_CFG.bytes_total = n
-            return gen.produce()
-        except Exception:
-            log.warning("camera source failed", extra={"cam_index": CAM_INDEX})
-    return b""
+            return next(self._it)
+        except BaseException:
+            self.close()
+            raise
 
-def _seed_provider(n: int) -> bytes:
-    """Proveedor para el DRBG: prioriza RAW; si no hay, intenta vídeo/cam; si se permite, completa con urandom."""
-    if q.available() >= n:
-        return q.poll(n)
-    # intenta rellenar desde vídeo/cam
-    extra = _try_bytes_from_video_or_cam(n)
-    if extra:
-        return extra if len(extra) >= n else extra + os.urandom(n - len(extra)) if ALLOW_URANDOM_BOOT else extra
-    # como último recurso, urandom sólo si se permite
-    if ALLOW_URANDOM_BOOT:
-        return os.urandom(n)
-    return b""  # dejar que el caller decida si petar
+    def close(self) -> None:
+        if not self._done:
+            self._done = True
+            self._release()
 
-_rng = AleaMaris(_seed_provider)  # DRBG ChaCha20 con reseed interval interno
-_rng.reseed_interval_bytes = RESEED_INTERVAL_BYTES
-_rng.set_buffer_chunk_size(BUF_CHUNK_BYTES)
-_fill_task: asyncio.Task | None = None
-_reseed_task: asyncio.Task | None = None
-_warm_task: asyncio.Task | None = None
-_threadpool: concurrent.futures.ThreadPoolExecutor | None = None
-
-# -------------------- Helpers de reseed y fill --------------------
-def _reseed_from_queue(limit_bytes: int = RESEED_BYTES) -> int:
-    """Coge hasta limit_bytes de la RAW y reseedea el DRBG. Devuelve bytes usados."""
-    avail = q.available()
-    if avail <= 0:
-        return 0
-    n = min(avail, limit_bytes)
-    data = q.poll(n)
-    if data:
-        _rng.reseed(data)
-        return len(data)
-    return 0
-
-def _maybe_reseed_opportunistic() -> None:
-    """Reseed sólo si el DRBG ya expandió suficiente (umbral interno)."""
-    try:
-        _rng.maybe_reseed()
-    except Exception:
-        pass
-
-async def _filler_loop():
-    """Mantiene la cola RAW entre LOW y HIGH; usa vídeo/cam; si no hay y se permite, urandom; si no, espera."""
-    while True:
-        try:
-            avail = q.available()
-            if avail < FILL_LOW_WM:
-                need_total = min(FILL_HIGH_WM - avail, FILL_CHUNK_BYTES)
-                chunk = _try_bytes_from_video_or_cam(need_total)
-                if not chunk and ALLOW_URANDOM_BOOT:
-                    chunk = os.urandom(need_total)
-                if chunk:
-                    log.debug("filler offered to queue", extra={"offered": len(chunk), "available_before": avail})
-                    q.offer(chunk)
-        except Exception as e:
-            # No tiramos la app por fallos de cámara/vídeo; reintentamos en la próxima vuelta
-            log.error("filler loop error", extra={"error": str(e)})
-            pass
-        await asyncio.sleep(FILL_INTERVAL_MS / 1000.0)
-
-async def _reseed_loop():
-    """Reseed periódico del DRBG desde RAW; si no hay y se permite, mezcla urandom para no quedarse seco."""
-    while True:
-        try:
-            used = _reseed_from_queue(RESEED_BYTES)
-            if used == 0 and ALLOW_URANDOM_BOOT:
-                _rng.reseed(os.urandom(RESEED_BYTES))
-        except Exception:
-            pass
-        await asyncio.sleep(RESEED_PERIOD_SEC)
-
-async def _warm_loop():
-    """Calienta periódicamente el buffer del DRBG en un hilo aparte para no bloquear el event loop."""
-    # usamos un ThreadPoolExecutor chico dedicado
-    loop = asyncio.get_running_loop()
-    while True:
-        try:
-            # sólo si el buffer está por debajo del target calentamos
-            avail = _rng.buffer_available()
-            if avail < WARM_TARGET_BYTES:
-                # correr warm_buffer en thread, con chunk limitado para no pedir 4MiB de golpe si duele
-                fn = functools.partial(_rng.warm_buffer, WARM_TARGET_BYTES, chunk_size=WARM_CHUNK_BYTES)
-                await loop.run_in_executor(_threadpool, fn)
-        except Exception:
-            log.warning("warm loop error", exc_info=True)
-        await asyncio.sleep(WARM_PERIOD_SEC)
-
-@app.on_event("startup")
-async def _startup():
-    log.info("startup called")
-
-    # 1) Boot: intentar poblar la RAW con BOOT_BYTES
-    boot = _try_bytes_from_video_or_cam(BOOT_BYTES)
-    if not boot and ALLOW_URANDOM_BOOT:
-        log.warning("boot falling back to urandom")
-        boot = os.urandom(BOOT_BYTES)
-    if not boot:
-        # requisito: “si no hay vídeo/cam y no se permite urandom → PETA”
-        raise RuntimeError("AleaMaris: no entropy source available at startup and ALLOW_URANDOM disabled")
-
-    q.offer(boot)
-    log.info("boot entropy queued", extra={"bytes": len(boot), "raw_available": q.available()})
-
-    # 2) Lanza los procesos en background
-    global _fill_task, _reseed_task, _warm_task, _threadpool
-    loop = asyncio.get_event_loop()
-    # threadpool pequeño para tareas de calentado
-    _threadpool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="drbg-warm")
-    _fill_task = loop.create_task(_filler_loop())
-    _reseed_task = loop.create_task(_reseed_loop())
-    # Precalentar algo del buffer del DRBG en thread sin bloquear el arranque
-    if WARM_AT_START_BYTES > 0:
-        try:
-            fn = functools.partial(_rng.warm_buffer, WARM_AT_START_BYTES, chunk_size=WARM_CHUNK_BYTES)
-            # no esperamos; se ejecuta en background
-            loop.run_in_executor(_threadpool, fn)
-        except Exception:
-          log.warning("warm at start failed", exc_info=True)
-    _warm_task = loop.create_task(_warm_loop())
-    log.info("background tasks started", extra={"fill_period_ms": FILL_INTERVAL_MS, "reseed_period_s": RESEED_PERIOD_SEC})
-
-@app.on_event("shutdown")
-async def _shutdown():
-    for task in (_fill_task, _reseed_task, _warm_task):
-        if task:
-            task.cancel()
-    if _threadpool:
-        _threadpool.shutdown(wait=False, cancel_futures=True)
-    log.info("shutdown completed")
-
-@app.post("/trng/ingest")
-async def ingest(request: Request, x_api_key: str | None = Header(default=None)):
-    if API_KEY and x_api_key != API_KEY:
-        return Response(content=b'{"error":"unauthorized"}', status_code=401, media_type="application/json")
-    data = await request.body()
-    written = q.offer(data)
-    dropped = len(data) - written
-    log.info("ingest", extra={"received": written, "dropped": dropped, "available": q.available()})
-    return {"received": written, "dropped": dropped, "available": q.available()}
-
-@app.get("/trng/bytes")
-def get_bytes(count: int = 256):
-    c = max(1, min(count, 4096))
-    out = q.poll(c)
-    headers = {"X-Available-After": str(q.available())}
-    log.debug("trng bytes", extra={"requested": count, "served": len(out), "available_after": q.available()})
-    return Response(content=out, media_type="application/octet-stream", headers=headers)
-
-@app.get("/trng/raw")
-def get_raw(count: int = 256):
-    return get_bytes(count)
-
-@app.get("/trng/health")
-def health():
-    avail = q.available()
-    log.debug("health", extra={"available": avail})
-    return {"available": avail, "status": "ok"}
-
-@app.get("/rng/bytes")
-def rng_bytes(count: int = Query(default=256, ge=1, le=1_048_576),
-              reseed: bool = Query(default=False)):
-    # Reseed manual bajo demanda, si se pide; si no, oportunista
-    if reseed:
-        _reseed_from_queue()
-    else:
-        _maybe_reseed_opportunistic()
-    data = _rng.random_bytes(count)
-    log.debug("rng bytes", extra={"count": count})
-    return Response(content=data, media_type="application/octet-stream",
-                    headers={"X-Count": str(len(data))})
-
-@app.get("/rng/ints")
-def rng_ints(min: int = Query(default=0),
-             max: int = Query(default=36),
-             count: int = Query(default=10, ge=1, le=100_000),
-             reseed: bool = Query(default=False),
-             fmt: str = Query(default="json")):
-    if min > max:
-        return Response(status_code=400, content=b'{"error":"min>max"}', media_type="application/json")
-    if reseed:
-        _reseed_from_queue()
-    else:
-        _maybe_reseed_opportunistic()
-    log.debug("rng ints request", extra={"min": min, "max": max, "count": count, "fmt": fmt})
-    vals = [_rng.randint(min, max) for _ in range(count)]
-    if fmt == "bin":
-        payload = b"".join(struct.pack("<I", v) for v in vals)
-        return Response(content=payload, media_type="application/octet-stream",
-                        headers={"X-Count": str(len(vals))})
-    return {"count": len(vals), "min": min, "max": max, "values": vals}
-
-@app.post("/rng/reseed")
-async def rng_reseed(request: Request):
-    data = await request.body()
-    if not data:
-        return {"received": 0, "status": "no-op"}
-    _rng.reseed(data)
-    return {"received": len(data), "status": "ok"}
+    __del__ = close
 
 
+def _byte_chunks(drbg: ChildDRBG, total: int, chunk: int) -> Iterator[bytes]:
+    remaining = total
+    while remaining > 0:
+        take = min(chunk, remaining)
+        yield drbg.generate(take)
+        remaining -= take
 
-def _u32bin_stream(count: int, endian="le", batch=100_000):
+
+def _int_batches(drbg: ChildDRBG, lo: int, hi: int, count: int, batch: int) -> Iterator[np.ndarray]:
     remaining = count
     while remaining > 0:
         take = min(batch, remaining)
-        raw = _rng.random_bytes(take * 4)
-        if endian == "be":
-            # emitir tal cual
-            yield raw
+        yield randints(drbg.generate, lo, hi, take)
+        remaining -= take
+
+
+def create_app(settings: Optional[Settings] = None,
+               source_factory: Optional[Callable[[], VideoSource]] = None) -> FastAPI:
+    settings = settings or Settings.from_env()
+    if source_factory is None:
+        source_factory = default_source_factory(settings)
+
+    pool = TrngQueue(cap_bytes=settings.pool_cap_bytes)
+    collector = EntropyCollector(
+        source_factory, pool,
+        h_claim=settings.h_claim,
+        max_samples=settings.max_samples_per_frame,
+        bits_per_block=settings.bits_per_block,
+        credit_non_physical=settings.credit_file_source,
+        max_consecutive_failures=settings.max_consecutive_failures,
+    )
+    feeder = ReseedFeeder(pool, allow_urandom=settings.allow_urandom)
+    slots = _StreamSlots(settings.max_concurrent_streams)
+    state: dict = {"rng": None, "seeded_from": None}
+
+    async def _reseed_loop(rng: AleaMaris):
+        while True:
+            await asyncio.sleep(settings.reseed_period_sec)
+            try:
+                await asyncio.to_thread(rng.reseed_from_source)
+            except Exception:
+                log.warning("periodic reseed failed", exc_info=True)
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        collector.start()
+        got = await asyncio.to_thread(collector.wait_for, SEED_BYTES, settings.boot_timeout_sec)
+        seed = pool.poll(SEED_BYTES, exact=True) if got else b""
+        if seed:
+            state["seeded_from"] = "trng"
+            if settings.allow_urandom:
+                seed += os.urandom(32)  # mixing in more never hurts
+                state["seeded_from"] = "trng+urandom"
+        elif settings.allow_urandom:
+            log.warning("no TRNG entropy at boot; seeding DRBG from os.urandom", extra=collector.status())
+            seed = os.urandom(SEED_BYTES)
+            state["seeded_from"] = "urandom"
         else:
-            # swap a little endian
-            mv = memoryview(raw)
-            out = bytearray(len(raw))
-            out[0::4] = mv[3::4]
-            out[1::4] = mv[2::4]
-            out[2::4] = mv[1::4]
-            out[3::4] = mv[0::4]
-            yield bytes(out)
-        remaining -= take
+            collector.stop()
+            raise RuntimeError("AleaMaris: no TRNG entropy at startup and ALEAMARIS_ALLOW_URANDOM is off "
+                               f"(collector state: {collector.state})")
+        rng = AleaMaris(seed,
+                        reseed_interval_bytes=settings.reseed_interval_bytes,
+                        reseed_bytes=settings.reseed_bytes,
+                        entropy_source=feeder)
+        state["rng"] = rng
+        task = asyncio.create_task(_reseed_loop(rng))
+        log.info("startup completed", extra={"seeded_from": state["seeded_from"], **collector.status()})
+        try:
+            yield
+        finally:
+            task.cancel()
+            await asyncio.to_thread(collector.stop)
+            log.info("shutdown completed")
 
-@app.get("/rng/u32.bin")
-def rng_u32_bin(count: int = Query(100_000, ge=1, le=25_000_000),
-                endian: str = Query("le", pattern="^(le|be)$"),
-                reseed: bool = Query(default=False)):
-    if reseed:
-        _reseed_from_queue()
-    else:
-        _maybe_reseed_opportunistic()
-    log.debug("rng u32 bin", extra={"count": count, "endian": endian})
-    return StreamingResponse(
-        _u32bin_stream(count, endian=endian),
-        media_type="application/octet-stream",
-        headers={"X-Count": str(count)}
+    app = FastAPI(title="AleaMaris TRNG API", lifespan=lifespan)
+    app.state.settings = settings
+    app.state.pool = pool
+    app.state.collector = collector
+    app.state.feeder = feeder
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origins,
+        allow_credentials=False,
+        allow_methods=["GET", "POST"],
+        allow_headers=["*"],
+        expose_headers=["X-Count", "X-Dtype", "X-TRNG-Demo", "X-Available-After", "X-Request-ID"],
     )
 
-def _u32jsonl_stream(count: int, batch=100_000):
-    import struct
-    remaining = count
-    while remaining > 0:
-        take = min(batch, remaining)
-        raw = _rng.random_bytes(take * 4)
-        ints = struct.unpack(">" + "I"*take, raw)
-        yield ("\n".join(str(x) for x in ints) + "\n").encode()
-        remaining -= take
+    def rng() -> AleaMaris:
+        r = state["rng"]
+        if r is None:
+            raise HTTPException(status_code=503, detail="DRBG not seeded yet")
+        return r
 
-@app.get("/rng/u32.jsonl")
-def rng_u32_jsonl(count: int = Query(100_000, ge=1, le=2_000_000),
-                  reseed: bool = Query(default=False)):
-    if reseed:
-        _reseed_from_queue()
-    else:
-        _maybe_reseed_opportunistic()
-    log.debug("rng u32 jsonl", extra={"count": count})
-    return StreamingResponse(
-        _u32jsonl_stream(count),
-        media_type="application/x-ndjson",
-        headers={"X-Count": str(count)}
-    )
+    def require_api_key(x_api_key: str | None = Header(default=None)) -> None:
+        if not settings.api_key:
+            raise HTTPException(status_code=403, detail="endpoint disabled: set ALEAMARIS_API_KEY to enable it")
+        if not x_api_key or not hmac.compare_digest(x_api_key.encode(), settings.api_key.encode()):
+            raise HTTPException(status_code=401, detail="unauthorized")
+
+    async def read_limited(request: Request) -> bytes:
+        limit = settings.max_ingest_bytes
+        cl = request.headers.get("content-length")
+        if cl and cl.isdigit() and int(cl) > limit:
+            raise HTTPException(status_code=413, detail=f"body larger than {limit} bytes")
+        buf = bytearray()
+        async for chunk in request.stream():
+            buf += chunk
+            if len(buf) > limit:
+                raise HTTPException(status_code=413, detail=f"body larger than {limit} bytes")
+        return bytes(buf)
+
+    def maybe_reseed(reseed: bool) -> None:
+        if reseed:
+            rng().reseed_from_source()
+
+    def check_size(nbytes: int) -> None:
+        if nbytes > settings.max_stream_bytes:
+            raise HTTPException(status_code=413,
+                                detail=f"request is {nbytes} bytes; max is {settings.max_stream_bytes}")
+
+    def stream(chunks: Iterator[bytes], media_type: str, headers: dict) -> StreamingResponse:
+        slots.acquire()
+        # sync iterator: Starlette runs it in a worker thread, the event loop never blocks
+        return StreamingResponse(slots.guard(chunks), media_type=media_type, headers=headers)
+
+    # ------------------------------------------------------------------ TRNG
+    @app.post("/trng/ingest", dependencies=[Depends(require_api_key)])
+    async def ingest(request: Request):
+        """External entropy (e.g. an ESP32 noise source). It is only *mixed into*
+        the DRBG state; it is never handed out to clients as random bytes."""
+        data = await read_limited(request)
+        accepted = feeder.add_ingested(data)
+        log.info("ingest", extra={"received": accepted, "dropped": len(data) - accepted})
+        return {"received": accepted, "dropped": len(data) - accepted,
+                "available": pool.available(), "status": "queued-for-drbg-reseed"}
+
+    @app.get("/trng/bytes")
+    def trng_bytes(count: int = Query(default=256, ge=1)):
+        if count > settings.trng_max_request:
+            raise HTTPException(status_code=400, detail=f"count must be <= {settings.trng_max_request}; "
+                                                        "use /rng/* for large amounts")
+        out = pool.poll(count, exact=True)
+        if not out:
+            return JSONResponse(status_code=503, headers={"Retry-After": "1"}, content={
+                "error": "not enough TRNG entropy available yet",
+                "available": pool.available(), "requested": count, "source_state": collector.state})
+        headers = {"X-Count": str(len(out)), "X-Available-After": str(pool.available())}
+        if not collector.source_physical:
+            # demo mode only: bytes derived from a recording are reproducible
+            headers["X-TRNG-Demo"] = "recorded-source-not-secret"
+        return Response(content=out, media_type="application/octet-stream", headers=headers)
+
+    @app.get("/trng/raw")
+    def trng_raw(count: int = Query(default=256, ge=1)):
+        return trng_bytes(count)
+
+    @app.get("/trng/health")
+    def health():
+        st = collector.status()
+        stale = st["seconds_since_last_frame"]
+        if st["state"] == "failed":
+            status = "failed"
+        elif st["state"] == "running" and stale is not None and stale > settings.stall_timeout_sec:
+            status = "degraded"  # source open but no frame lately (hung driver?)
+        elif st["state"] == "running" and st["entropy_credited"]:
+            # a recorded video in demo mode works, but its output is not secret
+            status = "ok" if st["physical"] else "demo"
+        else:
+            status = "degraded"  # no source, exhausted, unavailable or not credited
+        return {"status": status, "available": pool.available(), "pool_cap": pool.cap,
+                "drbg_seeded_from": state["seeded_from"], "collector": st}
+
+    # ------------------------------------------------------------------ DRBG
+    @app.get("/rng/bytes")
+    def rng_bytes(count: int = Query(default=256, ge=1), reseed: bool = False):
+        check_size(count)
+        maybe_reseed(reseed)
+        headers = {"X-Count": str(count)}
+        if count <= settings.stream_chunk_bytes:
+            return Response(content=rng().random_bytes(count), media_type="application/octet-stream",
+                            headers=headers)
+        child = rng().fork()
+        return stream(_byte_chunks(child, count, settings.stream_chunk_bytes),
+                      "application/octet-stream", headers)
+
+    @app.get("/rng/ints")
+    def rng_ints(min: int = Query(default=0), max: int = Query(default=36),
+                 count: int = Query(default=10, ge=1),
+                 fmt: str = Query(default="json", pattern="^(json|ndjson|bin)$"),
+                 reseed: bool = False):
+        lo, hi = min, max
+        if lo > hi:
+            raise HTTPException(status_code=400, detail="min must be <= max")
+        maybe_reseed(reseed)
+
+        if lo < INT64_MIN or hi > INT64_MAX:
+            # arbitrary precision: exact and unbiased, but scalar
+            if fmt != "json" or count > MAX_BIGINT_COUNT:
+                raise HTTPException(status_code=400, detail=f"bounds beyond int64 support fmt=json and "
+                                                            f"count <= {MAX_BIGINT_COUNT}")
+            r = rng()
+            vals = [lo + randbelow(r.random_bytes, hi - lo + 1) for _ in range(count)]
+            return {"count": count, "min": lo, "max": hi, "values": [str(v) for v in vals]}
+
+        if fmt == "json":
+            if count > settings.max_json_ints:
+                raise HTTPException(status_code=400, detail=f"fmt=json supports count <= {settings.max_json_ints}; "
+                                                            "use fmt=ndjson or fmt=bin for more")
+            vals = rng().randints(lo, hi, count)
+            body = (f'{{"count":{count},"min":{lo},"max":{hi},"values":['
+                    + ",".join(map(str, vals.tolist())) + "]}")
+            return Response(content=body, media_type="application/json", headers={"X-Count": str(count)})
+
+        child = rng().fork()
+        if fmt == "ndjson":
+            check_size(count * 21)  # worst case "-9223372036854775808\n"
+            chunks = ("\n".join(map(str, a.tolist())).encode() + b"\n"
+                      for a in _int_batches(child, lo, hi, count, NDJSON_BATCH))
+            return stream(chunks, "application/x-ndjson", {"X-Count": str(count)})
+
+        # bin: u32 LE when everything fits, otherwise i64 LE
+        dtype = "<u4" if lo >= 0 and hi <= 0xFFFFFFFF else "<i8"
+        itemsize = np.dtype(dtype).itemsize
+        check_size(count * itemsize)
+        batch = settings.stream_chunk_bytes // itemsize
+        chunks = (a.astype(dtype).tobytes() for a in _int_batches(child, lo, hi, count, batch))
+        return stream(chunks, "application/octet-stream",
+                      {"X-Count": str(count), "X-Dtype": "u32le" if dtype == "<u4" else "i64le"})
+
+    @app.get("/rng/u32.bin")
+    def rng_u32_bin(count: int = Query(100_000, ge=1),
+                    endian: str = Query("le", pattern="^(le|be)$"),
+                    reseed: bool = False):
+        # Uniform random bytes are uniform u32s in either byte order, so `endian`
+        # only documents how the client should read them; no swapping needed.
+        nbytes = count * 4
+        check_size(nbytes)
+        maybe_reseed(reseed)
+        child = rng().fork()
+        return stream(_byte_chunks(child, nbytes, settings.stream_chunk_bytes),
+                      "application/octet-stream", {"X-Count": str(count), "X-Dtype": f"u32{endian}"})
+
+    @app.get("/rng/u32.jsonl")
+    def rng_u32_jsonl(count: int = Query(100_000, ge=1), reseed: bool = False):
+        check_size(count * 11)
+        maybe_reseed(reseed)
+        child = rng().fork()
+
+        def chunks():
+            remaining = count
+            while remaining > 0:
+                take = min(NDJSON_BATCH, remaining)
+                a = np.frombuffer(child.generate(take * 4), dtype="<u4")
+                yield ("\n".join(map(str, a.tolist())) + "\n").encode()
+                remaining -= take
+
+        return stream(chunks(), "application/x-ndjson", {"X-Count": str(count)})
+
+    @app.post("/rng/reseed", dependencies=[Depends(require_api_key)])
+    async def rng_reseed(request: Request):
+        data = await read_limited(request)
+        if not data:
+            return {"received": 0, "status": "no-op"}
+        rng().reseed(data)
+        return {"received": len(data), "status": "ok"}
+
+    @app.get("/rng/stats")
+    def rng_stats():
+        st = collector.status()
+        return {
+            **rng().stats(),
+            "drbg_seeded_from": state["seeded_from"],
+            "reseed_period_sec": settings.reseed_period_sec,
+            "reseed_sources_bytes": dict(feeder.used),
+            "allow_urandom": settings.allow_urandom,
+            "raw_available": pool.available(),
+            "fill_high_wm": pool.cap,
+            "trng_total_bytes": pool.total_in,
+            "trng_state": st["state"],
+            "trng_source": st["source"],
+            "trng_physical": st["physical"],
+            "trng_entropy_credited": st["entropy_credited"],
+            "trng_min_entropy_estimate": st["last_min_entropy_estimate"],
+            "trng_h_claim": st["h_claim_bits_per_sample"],
+            "trng_frames": st["frames"],
+            "trng_frames_failed": st["frames_failed"],
+            "max_stream_bytes": settings.max_stream_bytes,
+        }
+
+    # ------------------------------------------------- request-id correlation
+    @app.middleware("http")
+    async def add_request_id(request: Request, call_next):
+        rid = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+        token = request_id_ctx.set(rid)
+        try:
+            resp: Response = await call_next(request)
+            resp.headers["X-Request-ID"] = rid
+            return resp
+        finally:
+            request_id_ctx.reset(token)
+
+    return app
 
 
-@app.get("/rng/stats")
-def rng_stats():
-    rep = {
-        "generated_bytes_since_last_reseed": _rng.generated,
-        "reseed_interval_bytes": _rng.reseed_interval_bytes,
-    "buffer_available": _rng.buffer_available(),
-    "buffer_chunk_bytes": BUF_CHUNK_BYTES,
-    "warm_target_bytes": WARM_TARGET_BYTES,
-        "raw_available": q.available(),
-        "boot_bytes": BOOT_BYTES,
-        "allow_urandom_boot": ALLOW_URANDOM_BOOT,
-        "fill_low_wm": FILL_LOW_WM,
-        "fill_high_wm": FILL_HIGH_WM,
-        "reseed_period_sec": RESEED_PERIOD_SEC,
-        "reseed_bytes": RESEED_BYTES
-    }
-    log.debug("rng stats", extra={"raw_available": rep["raw_available"], "buffer_available": rep["buffer_available"]})
-    return rep
-
-# -------- Middleware de correlación de request_id --------
-@app.middleware("http")
-async def add_request_id(request: Request, call_next):
-    rid = request.headers.get("X-Request-ID") or str(uuid.uuid4())
-    token = request_id_ctx.set(rid)
-    try:
-        log.debug("request start", extra={"method": request.method, "path": request.url.path})
-        resp: Response = await call_next(request)
-        resp.headers["X-Request-ID"] = rid
-        log.debug("request end", extra={"status": resp.status_code})
-        return resp
-    finally:
-        request_id_ctx.reset(token)
+app = create_app()

@@ -92,19 +92,19 @@
       </div>
       <div class="grid-2 mt-3">
         <div>
-          <div class="text-sm text-slate-600">RAW available</div>
+          <div class="text-sm text-slate-600">TRNG pool available</div>
           <div class="mono text-xl" id="rawAvail">—</div>
           <div class="w-full bg-slate-200 rounded mt-2">
             <div id="rawBar" class="bg-indigo-500 h-2 rounded" style="width:0%"></div>
           </div>
           <canvas id="spark" class="spark mt-2"></canvas>
           <div class="mt-5"></div>
-          <div class="text-sm text-slate-600">DRBG buffer available</div>
-          <div class="mono text-xl" id="bufAvail">—</div>
+          <div class="text-sm text-slate-600">TRNG min-entropy estimate (bits/sample, max 8)</div>
+          <div class="mono text-xl" id="hEst">—</div>
           <div class="w-full bg-slate-200 rounded mt-2">
-            <div id="bufBar" class="bg-emerald-500 h-2 rounded" style="width:0%"></div>
+            <div id="hBar" class="bg-emerald-500 h-2 rounded" style="width:0%"></div>
           </div>
-          <canvas id="bufSpark" class="spark mt-2"></canvas>
+          <canvas id="hSpark" class="spark mt-2"></canvas>
         </div>
         <div class="grid grid-cols-2 gap-3">
           <div>
@@ -124,12 +124,20 @@
             <div class="mono text-xl"><span id="reseedBytes">—</span> B</div>
           </div>
           <div>
-            <div class="text-sm text-slate-600">Buffer target</div>
-            <div class="mono text-xl" id="warmTarget">—</div>
+            <div class="text-sm text-slate-600">TRNG source</div>
+            <div class="mono text-sm break-all" id="trngSource">—</div>
           </div>
           <div>
-            <div class="text-sm text-slate-600">Buffer chunk</div>
-            <div class="mono text-xl" id="bufChunk">—</div>
+            <div class="text-sm text-slate-600">TRNG state · frames failed</div>
+            <div class="mono text-xl"><span id="trngState">—</span> · <span id="trngFailed">—</span></div>
+          </div>
+          <div>
+            <div class="text-sm text-slate-600">DRBG seeded from</div>
+            <div class="mono text-xl" id="seededFrom">—</div>
+          </div>
+          <div>
+            <div class="text-sm text-slate-600">Reseeds</div>
+            <div class="mono text-xl" id="reseedCount">—</div>
           </div>
         </div>
       </div>
@@ -137,7 +145,7 @@
 
     <!-- RAW controls -->
     <section class="card">
-      <h2 class="font-bold text-lg mb-3">RAW (pre-hash)</h2>
+      <h2 class="font-bold text-lg mb-3">TRNG (health-tested, SHA-256 conditioned)</h2>
       <div class="grid-2">
         <div class="space-y-3">
           <div class="flex gap-2 items-end">
@@ -152,7 +160,7 @@
           <div class="text-xs text-slate-600">Time: <span id="rawTime">—</span> ms · Size: <span id="rawSize">—</span></div>
         </div>
         <div class="space-y-3">
-          <label class="block text-sm font-medium">Ingest RAW (append to queue)</label>
+          <label class="block text-sm font-medium">Ingest external entropy (mixed into the DRBG only; needs API key)</label>
           <input id="ingFile" type="file" class="block w-full rounded-xl border-slate-300">
           <button id="btnIngest" class="btn btn-primary mt-2">POST /trng/ingest</button>
           <div id="ingResult" class="text-sm text-slate-600 mt-2">—</div>
@@ -168,7 +176,7 @@
         <div class="flex flex-wrap gap-2 items-end">
           <div class="grow min-w-[14rem]">
             <label class="block text-sm font-medium">Bytes</label>
-            <input id="rngCount" type="number" value="1024" min="1" max="1048576" class="w-full mt-1 rounded-xl border-slate-300">
+            <input id="rngCount" type="number" value="1024" min="1" max="268435456" class="w-full mt-1 rounded-xl border-slate-300">
           </div>
           <label class="text-sm flex items-center gap-2">
             <input id="rngReseed" type="checkbox" class="w-4 h-4"> reseed
@@ -196,13 +204,13 @@
           </div>
           <div class="grow min-w-[14rem]">
             <label class="block text-sm font-medium">count</label>
-            <input id="intCount" type="number" value="10" min="1" max="100000" class="w-full mt-1 rounded-xl border-slate-300">
+            <input id="intCount" type="number" value="10" min="1" max="1000000" class="w-full mt-1 rounded-xl border-slate-300">
           </div>
           <label class="text-sm flex items-center gap-2">
             <input id="intsReseed" type="checkbox" class="w-4 h-4"> reseed
           </label>
           <button id="btnInts" class="btn btn-ghost">GET /rng/ints (JSON)</button>
-          <button id="btnIntsBin" class="btn btn-primary">BIN (u32 LE)</button>
+          <button id="btnIntsBin" class="btn btn-primary">BIN (u32/i64 LE)</button>
         </div>
         <textarea id="intsOut" rows="5" class="w-full mono rounded-xl border-slate-300" placeholder="[1, 5, 3, …]"></textarea>
         <div class="text-xs text-slate-600">Time: <span id="intsTime">—</span> ms · Count: <span id="intsCount">—</span> · Size: <span id="intsSize">—</span></div>
@@ -211,7 +219,7 @@
 
     <!-- Manual reseed -->
     <section class="card">
-      <h2 class="font-bold text-lg mb-3">Manual reseed</h2>
+      <h2 class="font-bold text-lg mb-3">Manual reseed (needs API key)</h2>
       <div class="space-y-3">
         <div>
           <label class="block text-sm font-medium">Upload seed (octet-stream)</label>
@@ -230,7 +238,7 @@
           <div class="flex gap-2 items-end">
             <div class="grow min-w-[14rem]">
               <label class="block text-sm font-medium">Count (uint32)</label>
-              <input id="u32Count" type="number" value="100000" min="1" max="25000000" class="w-full mt-1 rounded-xl border-slate-300">
+              <input id="u32Count" type="number" value="100000" min="1" max="100000000" class="w-full mt-1 rounded-xl border-slate-300">
             </div>
             <div>
               <label class="block text-sm font-medium">Endian</label>
@@ -304,12 +312,12 @@ const first = view.getUint32(0, true); // LE</pre>
       sparkData.push(v); if(sparkData.length>80) sparkData.shift();
       drawSpark(spark, ctx, sparkData, '#93c5fd');
     }
-    // Buffer spark
-    const bufSpark = $('#bufSpark'); const bctx = bufSpark.getContext('2d');
-    const bufData = [];
-    function pushSparkBuf(v){
-      bufData.push(v); if(bufData.length>80) bufData.shift();
-      drawSpark(bufSpark, bctx, bufData, '#34d399');
+    // Min-entropy spark
+    const hSpark = $('#hSpark'); const hctx = hSpark.getContext('2d');
+    const hData = [];
+    function pushSparkH(v){
+      hData.push(v); if(hData.length>80) hData.shift();
+      drawSpark(hSpark, hctx, hData, '#34d399');
     }
 
     // --- API calls ---
@@ -336,21 +344,23 @@ const first = view.getUint32(0, true); // LE</pre>
         pushSpark(j.raw_available||0);
         const pct = Math.max(0, Math.min(100, (j.raw_available/(j.fill_high_wm||1))*100));
         $('#rawBar').style.width = pct.toFixed(1)+'%';
-        // DRBG buffer
-        const bufAvail = j.buffer_available ?? 0;
-        const warmTarget = j.warm_target_bytes ?? 0;
-        $('#bufAvail').textContent = bufAvail;
-        $('#warmTarget').textContent = warmTarget;
-        $('#bufChunk').textContent = j.buffer_chunk_bytes ?? '—';
-        const bpct = warmTarget>0 ? Math.max(0, Math.min(100, (bufAvail/warmTarget)*100)) : 0;
-        $('#bufBar').style.width = bpct.toFixed(1)+'%';
-        pushSparkBuf(bufAvail||0);
+        // TRNG source health
+        const h = j.trng_min_entropy_estimate;
+        $('#hEst').textContent = (h == null) ? '—' : h.toFixed(2) + ' (credited ≤ ' + j.trng_h_claim + ')';
+        $('#hBar').style.width = (h == null ? 0 : Math.min(100, h/8*100)).toFixed(1)+'%';
+        if(h != null) pushSparkH(h);
+        $('#trngSource').textContent = (j.trng_source ?? 'none') + (j.trng_physical === false ? ' (recording: NOT secret)' : '');
+        $('#trngState').textContent = j.trng_state ?? '—';
+        $('#trngFailed').textContent = j.trng_frames_failed ?? '—';
+        $('#seededFrom').textContent = j.drbg_seeded_from ?? '—';
+        $('#reseedCount').textContent = j.reseed_count ?? '—';
         // DRBG reseed metrics
         $('#genSince').textContent = j.generated_bytes_since_last_reseed ?? '—';
         $('#reseedInt').textContent = j.reseed_interval_bytes ?? '—';
         $('#reseedPeriod').textContent = j.reseed_period_sec ?? '—';
         $('#reseedBytes').textContent = j.reseed_bytes ?? '—';
-        setStatus('ok', true);
+        const demo = j.trng_physical === false && j.trng_entropy_credited;
+        setStatus(demo ? 'demo' : (j.trng_state === 'running' ? 'ok' : (j.trng_state || 'ok')), j.trng_state !== 'failed');
       }catch(e){
         setStatus('down', false);
       }
@@ -397,7 +407,7 @@ const first = view.getUint32(0, true); // LE</pre>
     // --- DRBG ---
   $('#btnRngBytes').onclick = async ()=>{
       try{
-        const n = Math.max(1, Math.min(1048576, parseInt($('#rngCount').value||'0',10)));
+        const n = Math.max(1, Math.min(268435456, parseInt($('#rngCount').value||'0',10)));
     const reseed = $('#rngReseed').checked ? 'true':'false';
     const t0 = performance.now();
     const r = await apiGet(`/rng/bytes?count=${n}&reseed=${reseed}`);
@@ -411,7 +421,7 @@ const first = view.getUint32(0, true); // LE</pre>
     };
     $('#btnRngDownload').onclick = async ()=>{
       try{
-        const n = Math.max(1, Math.min(1048576, parseInt($('#rngCount').value||'0',10)));
+        const n = Math.max(1, Math.min(268435456, parseInt($('#rngCount').value||'0',10)));
         const reseed = $('#rngReseed').checked ? 'true':'false';
     const t0 = performance.now();
     const r = await apiGet(`/rng/bytes?count=${n}&reseed=${reseed}`);
@@ -446,7 +456,7 @@ const first = view.getUint32(0, true); // LE</pre>
     const r = await apiGet(`/rng/ints?min=${mi}&max=${ma}&count=${c}&reseed=${reseed}&fmt=bin`);
         const blob = await r.blob();
     const t1 = performance.now();
-        download('ints_u32le.bin', blob); refreshStats();
+        download('ints_' + (r.headers.get('X-Dtype') || 'u32le') + '.bin', blob); refreshStats();
     $('#intsTime').textContent = (t1 - t0).toFixed(2);
     $('#intsCount').textContent = c;
     $('#intsSize').textContent = (blob.size/1024).toFixed(2)+' KB';
@@ -494,7 +504,7 @@ const first = view.getUint32(0, true); // LE</pre>
     // --- High-throughput u32.bin ---
   $('#btnU32Bin').onclick = async ()=>{
       try{
-        const count = Math.max(1, Math.min(25_000_000, parseInt($('#u32Count').value||'0',10)));
+        const count = Math.max(1, Math.min(100_000_000, parseInt($('#u32Count').value||'0',10)));
         const endian = $('#u32Endian').value;
     const reseed = $('#u32Reseed').checked ? 'true':'false';
     const t0 = performance.now();

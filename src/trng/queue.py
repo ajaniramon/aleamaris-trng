@@ -1,50 +1,63 @@
+import threading
 from collections import deque
 
+
 class TrngQueue:
+    """Thread-safe bounded FIFO of conditioned TRNG bytes.
+
+    Every byte is handed out at most once, even with concurrent readers
+    (API worker threads, DRBG reseeds) and the collector thread writing.
     """
-    FIFO por bloques byte[] sin boxing; simple y suficiente para la API.
-    CAP_BYTES controla el tamaño máximo acumulado.
-    """
-    def __init__(self, cap_bytes: int = 1_000_000):
-        self.chunks: deque[bytes] = deque()
+
+    def __init__(self, cap_bytes: int = 1 << 20):
+        self._chunks: deque[bytes] = deque()
+        self._lock = threading.Lock()
         self.cap = cap_bytes
-        self.size = 0
+        self._size = 0
+        self.total_in = 0
+        self.total_out = 0
 
-    def offer(self, data: bytes) -> int:
-        room = self.cap - self.size
-        if room <= 0:
+    def offer(self, data: bytes, *, align: int = 1) -> int:
+        """Append as much of `data` as fits, in whole multiples of `align`
+        (so conditioned blocks are never cut). Returns bytes accepted."""
+        if not data:
             return 0
-        to_write = min(len(data), room)
-        if to_write <= 0:
-            return 0
-        if to_write == len(data):
-            self.chunks.append(data)
-            self.size += to_write
-            return to_write
-        # si no cabe entero, truncamos
-        self.chunks.append(data[:to_write])
-        self.size += to_write
-        return to_write
+        with self._lock:
+            room = (self.cap - self._size) // align * align
+            if room <= 0:
+                return 0
+            chunk = bytes(data[:room])
+            self._chunks.append(chunk)
+            self._size += len(chunk)
+            self.total_in += len(chunk)
+            return len(chunk)
 
-    def poll(self, count: int) -> bytes:
-        if self.size == 0 or count <= 0:
+    def poll(self, count: int, *, exact: bool = False) -> bytes:
+        """Remove and return up to `count` bytes (all `count` or nothing if exact)."""
+        if count <= 0:
             return b""
-        n = min(count, self.size)
-        out = bytearray()
-        remaining = n
-        while remaining > 0 and self.chunks:
-            head = self.chunks[0]
-            if len(head) <= remaining:
-                out += head
-                self.size -= len(head)
-                remaining -= len(head)
-                self.chunks.popleft()
-            else:
-                out += head[:remaining]
-                self.chunks[0] = head[remaining:]
-                self.size -= remaining
-                remaining = 0
-        return bytes(out)
+        with self._lock:
+            if self._size == 0 or (exact and self._size < count):
+                return b""
+            n = min(count, self._size)
+            out = bytearray()
+            while len(out) < n:
+                head = self._chunks[0]
+                need = n - len(out)
+                if len(head) <= need:
+                    out += head
+                    self._chunks.popleft()
+                else:
+                    out += head[:need]
+                    self._chunks[0] = head[need:]
+            self._size -= n
+            self.total_out += n
+            return bytes(out)
 
     def available(self) -> int:
-        return self.size
+        with self._lock:
+            return self._size
+
+    def free(self) -> int:
+        with self._lock:
+            return self.cap - self._size

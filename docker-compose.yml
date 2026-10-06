@@ -7,10 +7,15 @@ services:
       dockerfile: Dockerfile
     image: aleamaris-trng-api:latest
     environment:
-      # Fuente de vídeo por defecto; puedes sobreescribir con una ruta válida dentro del contenedor
+      # Vídeo grabado sin acreditar (NO es entropía real): /trng/bytes da 503.
+      # TRNG de verdad: ALEAMARIS_USE_CAM=1 y devices: ["/dev/video0:/dev/video0"]
+      # Demo del pipeline (salida reproducible): ALEAMARIS_CREDIT_FILE_SOURCE=1
       - ALEAMARIS_VIDEO=/app/sample.MP4
-      # Permitir urandom para no bloquear si no hay vídeo/cámara en el entorno
+      - ALEAMARIS_CREDIT_FILE_SOURCE=${ALEAMARIS_CREDIT_FILE_SOURCE:-0}
+      # El DRBG puede tirar de os.urandom cuando el vídeo se agota
       - ALEAMARIS_ALLOW_URANDOM=1
+      # Sin key, /trng/ingest y /rng/reseed quedan deshabilitados (403)
+      - ALEAMARIS_API_KEY=${ALEAMARIS_API_KEY:-}
       # Logging estilo log4j en texto y persistencia a volumen
       - ALEAMARIS_LOG_LEVEL=INFO
       - ALEAMARIS_LOG_JSON=0
