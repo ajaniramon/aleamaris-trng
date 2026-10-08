@@ -80,6 +80,7 @@ class EntropyCollector:
         self.consecutive_failures = 0
         self.consecutive_read_failures = 0
         self.last_frame_at: Optional[float] = None
+        self.paused_pool_full = False  # recording paused on a full pool: no frames on purpose
         self.blocks = 0
         self.blocks_dropped_pool_full = 0
         self.duplicate_blocks = 0
@@ -185,9 +186,10 @@ class EntropyCollector:
             self._recent_blocks.popitem(last=False)
         return False
 
-    def step(self) -> int:
+    def step(self, *, condition: bool = True) -> int:
         """Read and process one frame. Returns conditioned bytes produced, or -1
-        if the source is gone (exhausted or could not be opened)."""
+        if the source is gone (exhausted or could not be opened). With
+        condition=False the frame is only health-tested: nothing is credited."""
         with self._lock:
             if not self.open():
                 return -1
@@ -216,7 +218,7 @@ class EntropyCollector:
             if prev is None or prev.shape != gray.shape:
                 return 0
             samples = diff_samples(gray, prev, self.max_samples)
-            blocks = self.process_samples(samples, credit=self.credited)
+            blocks = self.process_samples(samples, credit=self.credited and condition)
             return self.admit(blocks)
 
     # ---------- background thread ----------
@@ -252,14 +254,21 @@ class EntropyCollector:
 
     def _run(self) -> None:
         while not self._stop.is_set():
-            if self.pool.free() < BLOCK_BYTES:
-                # pool full: drop the reference frame so the next diff is between
-                # two fresh consecutive frames, then wait for consumers
+            full = self.pool.free() < BLOCK_BYTES
+            if full and self.source_physical is False:
+                # pool full on a recording: reading on would use it up for
+                # nothing. Drop the reference frame so the next diff is between
+                # two fresh consecutive frames, then wait for consumers.
+                self.paused_pool_full = True
                 self._prev = None
                 self._stop.wait(0.05)
                 continue
+            self.paused_pool_full = False
             try:
-                produced = self.step()
+                # pool full on a live camera: keep reading and health-testing
+                # frames, so a stalled or covered camera is still noticed, but
+                # condition nothing
+                produced = self.step(condition=not full)
             except Exception as e:
                 self.last_error = str(e)
                 log.error("collector error", exc_info=True)
@@ -270,6 +279,8 @@ class EntropyCollector:
                 if self.state == "exhausted":
                     return
                 self._stop.wait(self.reopen_delay_sec)
+            elif full:
+                self._stop.wait(0.05)  # no output wanted: never spin on a source that does not block
 
     def status(self) -> dict:
         return {
@@ -286,6 +297,7 @@ class EntropyCollector:
             "tile_pass_rate": round(self.tiles_passed / self.tiles, 4) if self.tiles else None,
             "seconds_since_last_frame": (round(time.monotonic() - self.last_frame_at, 3)
                                          if self.last_frame_at is not None else None),
+            "paused_pool_full": self.paused_pool_full,
             "blocks": self.blocks,
             "blocks_dropped_pool_full": self.blocks_dropped_pool_full,
             "duplicate_blocks": self.duplicate_blocks,

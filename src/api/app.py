@@ -244,7 +244,8 @@ def create_app(settings: Optional[Settings] = None,
         stale = st["seconds_since_last_frame"]
         if st["state"] == "failed":
             status = "failed"
-        elif st["state"] == "running" and stale is not None and stale > settings.stall_timeout_sec:
+        elif (st["state"] == "running" and stale is not None and stale > settings.stall_timeout_sec
+              and not st["paused_pool_full"]):
             status = "degraded"  # source open but no frame lately (hung driver?)
         elif st["state"] == "running" and st["entropy_credited"]:
             # a recorded video in demo mode works, but its output is not secret

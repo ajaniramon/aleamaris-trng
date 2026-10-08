@@ -215,6 +215,18 @@ def test_health_degraded_when_frames_stall():
         release.set()
 
 
+def test_health_ok_on_idle_server_with_full_pool():
+    # nobody consuming: the pool fills up, but the camera must not look stalled
+    with client(pool_cap_bytes=256, stall_timeout_sec=0.3) as tc:
+        deadline = time.time() + 5
+        while tc.get("/trng/health").json()["available"] <= 256 - 32 and time.time() < deadline:
+            time.sleep(0.05)
+        time.sleep(0.6)  # twice the stall timeout
+        h = tc.get("/trng/health").json()
+        assert h["available"] > 256 - 32  # no room for another 32-byte block
+        assert h["status"] == "ok", h
+
+
 def test_demo_header_only_for_recordings(c):
     deadline = time.time() + 10
     while c.get("/trng/health").json()["available"] < 32 and time.time() < deadline:

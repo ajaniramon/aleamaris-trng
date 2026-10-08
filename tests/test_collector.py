@@ -148,3 +148,50 @@ def test_restart_after_hung_stop_never_runs_two_workers():
     release.set()
     c.stop(timeout=5)
     assert c._thread is None and not worker.is_alive()
+
+
+def _wait(cond, timeout=5.0):
+    import time
+    deadline = time.monotonic() + timeout
+    while not cond() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    return cond()
+
+
+def test_live_camera_keeps_being_tested_while_pool_is_full():
+    pool = TrngQueue(cap_bytes=64)
+    pool.offer(b"\0" * 64)  # nobody consuming: pool already full
+    c = EntropyCollector(lambda: FrozenCamera(), pool, max_consecutive_failures=3)
+    c.start()
+    try:
+        # e.g. lens covered on an idle server: must still be noticed
+        assert _wait(lambda: c.state == "failed")
+        assert c.status()["seconds_since_last_frame"] < 1 and not c.status()["paused_pool_full"]
+    finally:
+        c.stop()
+
+
+def test_live_camera_credits_nothing_while_pool_is_full():
+    pool = TrngQueue(cap_bytes=64)
+    pool.offer(b"\0" * 64)
+    c = EntropyCollector(lambda: NoiseCamera(), pool)
+    c.start()
+    try:
+        assert _wait(lambda: c.frames >= 3)
+    finally:
+        c.stop()
+    st = c.status()
+    assert st["blocks"] == 0 and st["bits_credited"] == 0 and st["blocks_dropped_pool_full"] == 0
+
+
+def test_recording_pauses_while_pool_is_full():
+    pool = TrngQueue(cap_bytes=64)
+    pool.offer(b"\0" * 64)
+    rec = Replay(frames=50)
+    c = EntropyCollector(lambda: rec, pool, credit_non_physical=True)
+    c.start()
+    try:
+        assert _wait(lambda: c.status()["paused_pool_full"])
+        assert len(rec.frames) >= 49  # not used up for nothing
+    finally:
+        c.stop()
